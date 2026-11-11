@@ -1,0 +1,1046 @@
+// bq25895_tests — the driver over a double of the charger: a register file
+// that answers on an I2C bus the way TI's data sheet SLUSC88C (sections
+// 8.2 to 8.4) says a BQ25895 does, so the framing, the steps of every
+// field, the masked updates, the watchdog, the status, the fault register
+// that is read twice, the battery monitor with its one-shot conversion, the
+// boost mode and the ship mode are checked on the host, one transaction at a
+// time.
+//
+// The double's state, in `st`: 4 is 1 when a part is there, 5 the I2C
+// address, 29 the I2C clock, 60 the REG0B byte, 61 the faults REG0C answers
+// on its first read and 62 on the reads after, 63 the reads of REG0C since
+// the faults were set, 70 to 74 the codes of REG0E to REG12 that a
+// conversion loads, 80 the reads of REG02 that CONV_START stays set for, 81
+// is 1 when a conversion never finishes, 84 the reads of REG02 a conversion
+// stays busy for (1 when 0), 82 the reads of REG14 that
+// REG_RST stays set for, 83 is 1 when a reset never finishes, 46 is 1 more
+// than the reads of REG02 after which the part stops answering it and 47 the
+// reads made, 90 the milliseconds paused, 91 the pauses, 95 is 1 more than
+// the writes after which every write is refused (0 for no limit) and 96 the
+// writes made, 99 the entries in the log.  The log is: a register written
+// is 1, the register and the value; a register read is 2, the first
+// register and the count.
+
+use std.test
+use core.rt
+use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerSource, PowerManager, PowerManagerAsync }
+use dev_id.{ DeviceId, Identifiable }
+use bq25895
+use bq25895.{ Bq25895, Bq25895Port, Bq25895Adc, Bq25895Faults, Bq25895Host }
+
+// ── The double ───────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_list(c: Chip) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 99)
+        list.push(out, at(c.log, i))
+    out
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The registers at their reset values (Tables 8-8 to 8-28).
+fn defaults(c: Chip)
+    c.regs.insert(0x00, 0x48)
+    c.regs.insert(0x01, 0x45)
+    c.regs.insert(0x02, 0x3D)
+    c.regs.insert(0x03, 0x3A)
+    c.regs.insert(0x04, 0x20)
+    c.regs.insert(0x05, 0x13)
+    c.regs.insert(0x06, 0x5E)
+    c.regs.insert(0x07, 0x9D)
+    c.regs.insert(0x08, 0x00)
+    c.regs.insert(0x09, 0x44)
+    c.regs.insert(0x0A, 0x93)
+    c.regs.insert(0x0D, 0x12)
+    c.regs.insert(0x14, 0x39)
+
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        deaf: HashMap.new(),
+        mute: HashMap.new(),
+        log: HashMap.new() }
+    c.st.insert(4, 1)
+    c.st.insert(5, 0x6A)
+    defaults(c)
+    // A conversion loads: BATV 4208 mV (95 steps of 20 mV from 2304), SYSV
+    // 4112 mV (90), TSPCT 21 % + 40 steps, VBUSV 5000 mV (24) with VBUS_GD,
+    // ICHGR 1000 mA (20).
+    c.st.insert(70, 95)
+    c.st.insert(71, 90)
+    c.st.insert(72, 40)
+    c.st.insert(73, 0x80 | 24)
+    c.st.insert(74, 20)
+    c
+
+fn absent() -> Chip
+    let c = chip()
+    c.st.insert(4, 0)
+    c
+
+// A conversion's results reach REG0E to REG12.
+fn convert(c: Chip)
+    for i in 0..5
+        c.regs.insert(0x0E + i, at(c.st, 70 + i))
+
+fn set_faults(c: Chip, past: Int, now: Int)
+    c.st.insert(61, past)
+    c.st.insert(62, now)
+    c.st.insert(63, 0)
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x02
+        var v = at(c.regs, 0x02) & 0x7F
+        if at(c.st, 80) > 0
+            v = v | 0x80
+            c.st.insert(80, at(c.st, 80) - 1)
+            if at(c.st, 80) == 0
+                convert(c)
+        return v
+    if reg == 0x0B
+        return at(c.st, 60)
+    if reg == 0x0C
+        if at(c.st, 63) == 0
+            c.st.insert(63, 1)
+            return at(c.st, 61)
+        return at(c.st, 62)
+    if reg == 0x14
+        var v = at(c.regs, 0x14) & 0x7F
+        if at(c.st, 82) > 0
+            v = v | 0x80
+            c.st.insert(82, at(c.st, 82) - 1)
+        return v
+    at(c.regs, reg)
+
+// A write to a register: the read-only ones ignore it, WD_RST of REG03,
+// CONV_START of REG02 and REG_RST of REG14 start their actions and are not
+// stored.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if reg == 0x0B or reg == 0x0C or reg >= 0x0E and reg <= 0x13
+        return
+    if reg == 0x02
+        c.regs.insert(0x02, v & 0x7F)
+        if (v & 0x80) != 0 and (v & 0x40) == 0
+            var lag = 1
+            if at(c.st, 84) > 0
+                lag = at(c.st, 84)
+            if at(c.st, 81) == 1
+                lag = 1000000
+            c.st.insert(80, lag)
+        return
+    if reg == 0x03
+        c.regs.insert(0x03, v & 0xBF)
+        return
+    if reg == 0x14
+        if (v & 0x80) != 0
+            defaults(c)
+            c.st.insert(82, 3)
+            if at(c.st, 83) == 1
+                c.st.insert(82, 1000000)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(29, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        let r = data[0] as Int
+        if at(self.c.mute, r) == 1
+            return false
+        let lim = at(self.c.st, 95)
+        if lim > 0 and at(self.c.st, 96) >= lim - 1
+            return false
+        self.c.st.insert(96, at(self.c.st, 96) + 1)
+        for i in 1..data.len()
+            log_push(self.c, 1)
+            log_push(self.c, r + i - 1)
+            log_push(self.c, data[i] as Int)
+            chip_write(self.c, r + i - 1, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0
+            return None
+        let r = tx[0] as Int
+        if r == 0x02
+            let lim = at(self.c.st, 46)
+            if lim > 0 and at(self.c.st, 47) >= lim - 1
+                return None
+            self.c.st.insert(47, at(self.c.st, 47) + 1)
+        if at(self.c.deaf, r) == 1
+            return None
+        log_push(self.c, 2)
+        log_push(self.c, r)
+        log_push(self.c, n)
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, chip_read(self.c, r + i) as u8)
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x6A), 7)
+
+// The port: every method is the package's own function over the double; the
+// pauses are counted.
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bq25895Port for Dut
+    fn setup(self) -> Bool [hw]
+        bq25895.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bq25895.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bq25895.i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        self.bus.c.st.insert(90, at(self.bus.c.st, 90) + ms)
+        self.bus.c.st.insert(91, at(self.bus.c.st, 91) + 1)
+
+    fn irq_level(self) -> Int [hw]
+        bq25895.irq_level_of(self.pins, self.w)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c },
+        pins: FakePins { levels: HashMap.new(), modes: HashMap.new() },
+        w: W }
+
+fn chip_of(d: Dut) -> Chip
+    d.bus.c
+
+fn reg(d: Dut, r: Int) -> Int
+    at(d.bus.c.regs, r)
+
+// ── The steps of the fields ──────────────────────────────────────────
+
+@test
+fn test_the_input_current_limit_is_100_ma_and_50_ma_a_step() [io]
+    // REG00: "Offset: 100mA, Range: 100mA (000000) - 3.25A (111111)".
+    test.assert_eq(bq25895.ilim_ma(0), 100)
+    test.assert_eq(bq25895.ilim_ma(8), 500)
+    test.assert_eq(bq25895.ilim_ma(63), 3250)
+    test.assert_eq(bq25895.ilim_ma(0x40 + 8), 500)
+    test.assert_eq(bq25895.ilim_code(500), 8)
+    test.assert_eq(bq25895.ilim_code(525), 8)
+    test.assert_eq(bq25895.ilim_code(3250), 63)
+    test.assert_eq(bq25895.ilim_code(9000), 63)
+    test.assert_eq(bq25895.ilim_code(100), 0)
+    test.assert_eq(bq25895.ilim_code(0), 0)
+
+@test
+fn test_the_fast_charge_current_is_64_ma_a_step_to_5056_ma() [io]
+    // REG04: "Range: 0mA (0000000) - 5056mA (1001111)", default 2048 mA.
+    test.assert_eq(bq25895.ichg_ma(0), 0)
+    test.assert_eq(bq25895.ichg_ma(32), 2048)
+    test.assert_eq(bq25895.ichg_ma(79), 5056)
+    test.assert_eq(bq25895.ichg_code(2048), 32)
+    test.assert_eq(bq25895.ichg_code(2100), 32)
+    test.assert_eq(bq25895.ichg_code(5056), 79)
+    test.assert_eq(bq25895.ichg_code(6000), 79)
+    test.assert_eq(bq25895.ichg_code(0), 0)
+    test.assert_eq(bq25895.ichg_code(-5), 0)
+    test.assert_eq(bq25895.ichg_code(63), 0)
+
+@test
+fn test_the_precharge_and_termination_currents_are_64_ma_and_64_ma_a_step() [io]
+    // REG05: "Offset: 64mA, Range: 64mA - 1024mA", defaults 128 and 256 mA.
+    test.assert_eq(bq25895.ipre_ma(0), 64)
+    test.assert_eq(bq25895.ipre_ma(1), 128)
+    test.assert_eq(bq25895.ipre_ma(15), 1024)
+    test.assert_eq(bq25895.ipre_code(128), 1)
+    test.assert_eq(bq25895.ipre_code(190), 1)
+    test.assert_eq(bq25895.ipre_code(1024), 15)
+    test.assert_eq(bq25895.ipre_code(5000), 15)
+    test.assert_eq(bq25895.ipre_code(10), 0)
+    test.assert_eq(bq25895.iterm_ma(0), 64)
+    test.assert_eq(bq25895.iterm_ma(3), 256)
+    test.assert_eq(bq25895.iterm_ma(15), 1024)
+    test.assert_eq(bq25895.iterm_code(256), 3)
+    test.assert_eq(bq25895.iterm_code(300), 3)
+    test.assert_eq(bq25895.iterm_code(5000), 15)
+    test.assert_eq(bq25895.iterm_code(10), 0)
+
+@test
+fn test_the_charge_voltage_is_16_mv_a_step_from_3840_mv() [io]
+    // REG06: "Offset: 3.840V, Range: 3.840V - 4.608V (110000), Default:
+    // 4.208V (010111)".
+    test.assert_eq(bq25895.vreg_mv(0), 3840)
+    test.assert_eq(bq25895.vreg_mv(23), 4208)
+    test.assert_eq(bq25895.vreg_mv(48), 4608)
+    test.assert_eq(bq25895.vreg_code(4208), 23)
+    test.assert_eq(bq25895.vreg_code(4215), 23)
+    test.assert_eq(bq25895.vreg_code(4608), 48)
+    test.assert_eq(bq25895.vreg_code(5000), 48)
+    test.assert_eq(bq25895.vreg_code(3000), 0)
+
+@test
+fn test_the_system_the_input_and_the_boost_voltages() [io]
+    // REG03: "Offset: 3.0V, Range 3.0V - 3.7V, Default: 3.5V (101)".
+    test.assert_eq(bq25895.sysmin_mv(5), 3500)
+    test.assert_eq(bq25895.sysmin_mv(7), 3700)
+    test.assert_eq(bq25895.sysmin_code(3500), 5)
+    test.assert_eq(bq25895.sysmin_code(3550), 5)
+    test.assert_eq(bq25895.sysmin_code(4500), 7)
+    test.assert_eq(bq25895.sysmin_code(2000), 0)
+    // REG0D: "Offset: 2.6V, Range: 3.9V (0001101) - 15.3V (1111111),
+    // Default: 4.4V (0010010)"; below 3.9 V the part holds 3.9 V.
+    test.assert_eq(bq25895.vindpm_mv(18), 4400)
+    test.assert_eq(bq25895.vindpm_mv(127), 15300)
+    test.assert_eq(bq25895.vindpm_code(4400), 18)
+    test.assert_eq(bq25895.vindpm_code(3000), 13)
+    test.assert_eq(bq25895.vindpm_code(20000), 127)
+    // REG0A: "Offset: 4.55V, Range: 4.55V - 5.51V, Default: 5.126V (1001)".
+    test.assert_eq(bq25895.boostv_mv(9), 5126)
+    test.assert_eq(bq25895.boostv_mv(15), 5510)
+    test.assert_eq(bq25895.boostv_code(5126), 9)
+    test.assert_eq(bq25895.boostv_code(5130), 9)
+    test.assert_eq(bq25895.boostv_code(6000), 15)
+    test.assert_eq(bq25895.boostv_code(4000), 0)
+
+@test
+fn test_the_adc_codes_are_the_data_sheets_steps() [io]
+    // REG0E and REG0F: 2.304 V and 20 mV a step; REG10: 21 % and 0.465 % a
+    // step; REG11: 2.6 V and 100 mV a step; REG12: 50 mA a step.
+    test.assert_eq(bq25895.vbat_mv_of(0), 2304)
+    test.assert_eq(bq25895.vbat_mv_of(0x7F), 4844)
+    test.assert_eq(bq25895.vbat_mv_of(0x80 | 95), 4204)
+    test.assert_eq(bq25895.vsys_mv_of(90), 4104)
+    test.assert_eq(bq25895.vbus_mv_of(24), 5000)
+    test.assert_eq(bq25895.vbus_mv_of(0x80 | 24), 5000)
+    test.assert_eq(bq25895.ts_milli_pct_of(0), 21000)
+    test.assert_eq(bq25895.ts_milli_pct_of(127), 80055)
+    test.assert_eq(bq25895.ichgr_ma_of(20), 1000)
+    test.assert_eq(bq25895.ichgr_ma_of(127), 6350)
+
+// ── The framing and the register access ──────────────────────────────
+
+@test
+fn test_an_i2c_read_is_one_transaction_and_a_write_one_register() [io]
+    let c = chip()
+    let d = dut(c)
+    var b: DevBytes = Vec.new()
+    test.assert(bq25895.i2c_read_into(d.bus, d.w, 0x14, 1, var b))
+    test.assert_eq(b[0] as Int, 0x39)
+    test.assert(log_list(c) == [2, 0x14, 1])
+    log_clear(c)
+    test.assert(bq25895.i2c_write(d.bus, d.w, 0x04, 0x1FF))
+    test.assert(log_list(c) == [1, 0x04, 0xFF])
+    test.assert(not bq25895.i2c_read_into(dut(absent()).bus, d.w, 0x14, 1, var b))
+    test.assert(not bq25895.i2c_write(dut(absent()).bus, d.w, 0x04, 1))
+    test.assert(not bq25895.i2c_write(d.bus, dev_bus.wiring_spi(0, 25), 0x04, 1))
+
+@test
+fn test_setup_makes_the_bus_and_the_int_pin_ready() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq25895.i2c_setup(d.bus, d.pins, d.w))
+    test.assert_eq(at(c.st, 29), 400000)
+    // INT is open-drain: an input with a pull-up.
+    test.assert_eq(at(d.pins.modes, 7), 2)
+    test.assert(not bq25895.i2c_setup(d.bus, d.pins, dev_bus.wiring_spi(0, 25)))
+    test.assert_eq(bq25895.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x6A)), -1)
+    d.pins.levels.insert(7, 1)
+    test.assert_eq(bq25895.irq_level_of(d.pins, W), 1)
+    test.assert_eq(d.irq_level(), 1)
+
+@test
+fn test_a_register_is_read_written_and_updated_by_mask() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq25895.reg_read(d, 0x14) == Some(0x39))
+    test.assert(bq25895.reg_read(dut(absent()), 0x14) == None)
+    test.assert(bq25895.reg_write(d, 0x08, 0x5A))
+    test.assert_eq(reg(d, 0x08), 0x5A)
+    c.mute.insert(0x08, 1)
+    test.assert(not bq25895.reg_write(d, 0x08, 0x11))
+    c.mute.insert(0x08, 0)
+    // The part ignores a write to a read-only register: the read back
+    // differs.
+    test.assert(not bq25895.reg_write(d, 0x0B, 0x11))
+    // An update changes only the bits of the mask.
+    c.regs.insert(0x08, 0xF0)
+    test.assert(bq25895.reg_update(d, 0x08, 0x0F, 0x05))
+    test.assert_eq(reg(d, 0x08), 0xF5)
+    test.assert(not bq25895.reg_update(dut(absent()), 0x08, 0x0F, 0x05))
+    c.deaf.insert(0x08, 1)
+    test.assert(not bq25895.reg_update(d, 0x08, 0x0F, 0x05))
+    c.deaf.insert(0x08, 0)
+    c.mute.insert(0x08, 1)
+    test.assert(not bq25895.reg_update(d, 0x08, 0x0F, 0x01))
+
+// ── Identity and bring-up ────────────────────────────────────────────
+
+@test
+fn test_the_part_number_is_pn_111_and_the_revision_01() [io]
+    let d = dut(chip())
+    let id = bq25895.id_read(d) ?? DeviceId { who: 0, rev: None }
+    test.assert_eq(id.who, 7)
+    test.assert(id.rev == Some(1))
+    test.assert(bq25895.id_read(dut(absent())) == None)
+    // Another part number is another part: the bq25890 family reads PN
+    // other than 111.
+    let c = chip()
+    c.regs.insert(0x14, 0x10)
+    test.assert(bq25895.id_read(dut(c)) == None)
+
+@test
+fn test_a_reset_waits_for_reg_rst_to_clear() [io]
+    let c = chip()
+    c.regs.insert(0x04, 0x7F)
+    let d = dut(c)
+    test.assert(bq25895.reset(d))
+    // The registers are back at their reset values.
+    test.assert_eq(reg(d, 0x04), 0x20)
+    // It never clears.
+    let n = chip()
+    n.st.insert(83, 1)
+    test.assert(not bq25895.reset(dut(n)))
+    test.assert(not bq25895.reset(dut(absent())))
+    // The part takes the write and stops answering.
+    let m = chip()
+    m.deaf.insert(0x14, 1)
+    test.assert(not bq25895.reset(dut(m)))
+
+@test
+fn test_the_bring_up_disables_the_watchdog() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(reg(d, 0x07) & 0x30, 0x10)
+    test.assert(bq25895.start(d))
+    test.assert_eq(reg(d, 0x07) & 0x30, 0)
+    // The other bits of REG07 stay.
+    test.assert_eq(reg(d, 0x07), 0x8D)
+    test.assert(not bq25895.start(dut(absent())))
+    let w = Dut { bus: FakeI2c { c: c },
+        pins: FakePins { levels: HashMap.new(), modes: HashMap.new() },
+        w: dev_bus.wiring_spi(0, 25) }
+    test.assert(not bq25895.start(w))
+    let o = chip()
+    o.regs.insert(0x14, 0x00)
+    test.assert(not bq25895.start(dut(o)))
+    let m = chip()
+    m.mute.insert(0x07, 1)
+    test.assert(not bq25895.start(dut(m)))
+
+// ── The input ────────────────────────────────────────────────────────
+
+@test
+fn test_the_input_current_limit_is_set_by_mask_and_read_back() [io]
+    let d = dut(chip())
+    test.assert_eq(bq25895.input_current_get(d), 500)
+    test.assert_eq(bq25895.input_current_set(d, 1500), 1500)
+    test.assert_eq(reg(d, 0x00), 0x40 | 28)
+    test.assert_eq(bq25895.input_current_get(d), 1500)
+    test.assert_eq(bq25895.input_current_set(d, 1520), 1500)
+    test.assert_eq(bq25895.input_current_set(d, 9000), 3250)
+    // The in-effect limit is REG13 and not REG00.
+    let c = chip_of(d)
+    c.regs.insert(0x13, 0x40 | 20)
+    test.assert_eq(bq25895.input_current_effective(d), 1100)
+    test.assert_eq(bq25895.input_current_set(dut(absent()), 500), -1)
+    test.assert_eq(bq25895.input_current_get(dut(absent())), -1)
+    test.assert_eq(bq25895.input_current_effective(dut(absent())), -1)
+
+@test
+fn test_hiz_the_ilim_pin_and_vindpm_each_touch_their_own_bits() [io]
+    let d = dut(chip())
+    test.assert(bq25895.hiz_set(d, true))
+    test.assert_eq(reg(d, 0x00) & 0xC0, 0xC0)
+    test.assert(bq25895.hiz_set(d, false))
+    test.assert_eq(reg(d, 0x00) & 0xC0, 0x40)
+    test.assert(bq25895.ilim_pin_set(d, false))
+    test.assert_eq(reg(d, 0x00) & 0xC0, 0)
+    test.assert(bq25895.ilim_pin_set(d, true))
+    test.assert_eq(reg(d, 0x00) & 0xC0, 0x40)
+    test.assert_eq(reg(d, 0x00) & 0x3F, 8)
+    // VINDPM absolute: FORCE_VINDPM and the code.
+    test.assert_eq(bq25895.vindpm_set(d, 4500), 4500)
+    test.assert_eq(reg(d, 0x0D), 0x80 | 19)
+    test.assert_eq(bq25895.vindpm_set(d, 3000), 3900)
+    test.assert_eq(reg(d, 0x0D), 0x80 | 13)
+    test.assert_eq(bq25895.vindpm_set(dut(absent()), 4500), -1)
+
+@test
+fn test_the_optimizer_and_the_detection_settings_never_write_conv_start() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq25895.ico_set(d, false))
+    test.assert_eq(reg(d, 0x02) & 0x10, 0)
+    test.assert(bq25895.ico_set(d, true))
+    test.assert_eq(reg(d, 0x02) & 0x10, 0x10)
+    // A conversion is in flight (CONV_START reads 1) when ICO_EN changes:
+    // the write must not start another one.
+    c.st.insert(80, 5)
+    log_clear(c)
+    test.assert(bq25895.ico_set(d, false))
+    let l = log_list(c)
+    var wrote = -1
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] == 0x02
+            wrote = l[i + 2]
+        i = i + 3
+    test.assert_eq(wrote & 0x80, 0)
+    c.st.insert(80, 0)
+    test.assert(bq25895.detection_set(d, false, false, false))
+    test.assert_eq(reg(d, 0x02) & 0x0D, 0)
+    test.assert(bq25895.detection_set(d, true, true, true))
+    test.assert_eq(reg(d, 0x02) & 0x0D, 0x0D)
+    test.assert(bq25895.detection_set(d, true, false, true))
+    test.assert_eq(reg(d, 0x02) & 0x0D, 0x05)
+    c.regs.insert(0x14, 0x39 | 0x40)
+    test.assert(bq25895.ico_optimized(d) == Some(true))
+    c.regs.insert(0x14, 0x39)
+    test.assert(bq25895.ico_optimized(d) == Some(false))
+    test.assert(bq25895.ico_optimized(dut(absent())) == None)
+
+// ── The charge ───────────────────────────────────────────────────────
+
+@test
+fn test_the_charge_enable_and_the_minimum_system_voltage_share_reg03() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq25895.charge_enable(d, false))
+    test.assert_eq(reg(d, 0x03) & 0x10, 0)
+    test.assert(bq25895.charge_enable(d, true))
+    test.assert_eq(reg(d, 0x03) & 0x10, 0x10)
+    test.assert_eq(bq25895.sysmin_set(d, 3300), 3300)
+    test.assert_eq(reg(d, 0x03) & 0x0E, 3 << 1)
+    // The charge bit and OTG stay.
+    test.assert_eq(reg(d, 0x03) & 0x30, 0x30)
+    test.assert_eq(bq25895.sysmin_set(d, 9000), 3700)
+    // WD_RST is written as 0 whatever it reads: the register reads it set
+    // here, and the write does not carry it.
+    c.regs.insert(0x03, 0x7A)
+    log_clear(c)
+    test.assert(bq25895.charge_enable(d, true))
+    let l = log_list(c)
+    var wrote = -1
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] == 0x03
+            wrote = l[i + 2]
+        i = i + 3
+    test.assert_eq(wrote & 0x40, 0)
+    test.assert(not bq25895.charge_enable(dut(absent()), true))
+    test.assert_eq(bq25895.sysmin_set(dut(absent()), 3500), -1)
+    // A refused write, and a read back that differs.
+    c.mute.insert(0x03, 1)
+    test.assert(not bq25895.charge_enable(d, true))
+    test.assert_eq(bq25895.sysmin_set(d, 3500), -1)
+
+@test
+fn test_the_currents_and_the_voltage_are_set_and_read_by_field() [io]
+    let d = dut(chip())
+    test.assert_eq(bq25895.charge_current_get(d), 2048)
+    test.assert_eq(bq25895.charge_current_set(d, 1024), 1024)
+    test.assert_eq(reg(d, 0x04), 16)
+    test.assert_eq(bq25895.charge_current_get(d), 1024)
+    // EN_PUMPX, in the same register, is left alone.
+    let c = chip_of(d)
+    c.regs.insert(0x04, 0x80 | 16)
+    test.assert_eq(bq25895.charge_current_set(d, 2048), 2048)
+    test.assert_eq(reg(d, 0x04), 0x80 | 32)
+    test.assert_eq(bq25895.charge_current_set(d, 0), 0)
+    test.assert_eq(bq25895.charge_current_set(d, 9000), 5056)
+    test.assert_eq(bq25895.precharge_current_get(d), 128)
+    test.assert_eq(bq25895.precharge_current_set(d, 256), 256)
+    test.assert_eq(reg(d, 0x05), 0x30 | 3)
+    test.assert_eq(bq25895.precharge_current_get(d), 256)
+    test.assert_eq(bq25895.termination_current_get(d), 256)
+    test.assert_eq(bq25895.termination_current_set(d, 128), 128)
+    test.assert_eq(reg(d, 0x05), 0x30 | 1)
+    test.assert_eq(bq25895.termination_current_get(d), 128)
+    // The charge voltage keeps BATLOWV and VRECHG.
+    test.assert_eq(bq25895.charge_voltage_get(d), 4208)
+    test.assert_eq(bq25895.charge_voltage_set(d, 4352), 4352)
+    test.assert_eq(reg(d, 0x06), (32 << 2) | 0x02)
+    test.assert_eq(bq25895.charge_voltage_get(d), 4352)
+    let a = dut(absent())
+    test.assert_eq(bq25895.charge_current_set(a, 1024), -1)
+    test.assert_eq(bq25895.charge_current_get(a), -1)
+    test.assert_eq(bq25895.precharge_current_set(a, 256), -1)
+    test.assert_eq(bq25895.precharge_current_get(a), -1)
+    test.assert_eq(bq25895.termination_current_set(a, 256), -1)
+    test.assert_eq(bq25895.termination_current_get(a), -1)
+    test.assert_eq(bq25895.charge_voltage_set(a, 4200), -1)
+    test.assert_eq(bq25895.charge_voltage_get(a), -1)
+
+@test
+fn test_the_thresholds_the_termination_and_the_timers() [io]
+    let d = dut(chip())
+    test.assert(bq25895.recharge_threshold_set(d, 200))
+    test.assert_eq(reg(d, 0x06) & 0x01, 1)
+    test.assert(bq25895.recharge_threshold_set(d, 100))
+    test.assert_eq(reg(d, 0x06) & 0x01, 0)
+    test.assert(bq25895.precharge_threshold_set(d, 2800))
+    test.assert_eq(reg(d, 0x06) & 0x02, 0)
+    test.assert(bq25895.precharge_threshold_set(d, 3000))
+    test.assert_eq(reg(d, 0x06) & 0x02, 2)
+    test.assert(bq25895.termination_enable(d, false))
+    test.assert_eq(reg(d, 0x07) & 0x80, 0)
+    test.assert(bq25895.termination_enable(d, true))
+    test.assert_eq(reg(d, 0x07) & 0x80, 0x80)
+    // The safety timer: 5, 8, 12, 20 hours, or off.
+    let codes = [[5, 0], [8, 1], [12, 2], [20, 3]]
+    for pair in codes
+        test.assert(bq25895.safety_timer_set(d, pair[0]))
+        test.assert_eq(reg(d, 0x07) & 0x0E, 0x08 | (pair[1] << 1))
+    test.assert(bq25895.safety_timer_set(d, 0))
+    test.assert_eq(reg(d, 0x07) & 0x08, 0)
+    test.assert(not bq25895.safety_timer_set(d, 7))
+    test.assert(not bq25895.recharge_threshold_set(dut(absent()), 100))
+
+@test
+fn test_the_watchdog_is_set_by_period_and_fed_without_changing_reg03() [io]
+    let c = chip()
+    let d = dut(c)
+    for pair in [[0, 0], [40, 1], [80, 2], [160, 3]]
+        test.assert(bq25895.watchdog_set(d, pair[0]))
+        test.assert_eq((reg(d, 0x07) >> 4) & 3, pair[1])
+    test.assert(not bq25895.watchdog_set(d, 60))
+    test.assert(not bq25895.watchdog_set(d, -1))
+    // The feed writes REG03 as read with WD_RST set.
+    log_clear(c)
+    test.assert(bq25895.watchdog_feed(d))
+    test.assert(log_list(c) == [2, 0x03, 1, 1, 0x03, 0x3A | 0x40])
+    // The bit clears itself.
+    test.assert_eq(reg(d, 0x03), 0x3A)
+    test.assert(not bq25895.watchdog_feed(dut(absent())))
+    c.mute.insert(0x03, 1)
+    test.assert(not bq25895.watchdog_feed(d))
+
+// ── Status and faults ────────────────────────────────────────────────
+
+@test
+fn test_reg0b_decodes_the_input_the_charge_and_power_good() [io]
+    // VBUS_STAT 3 (USB DCP), CHRG_STAT 2 (fast charging), PG_STAT 1,
+    // SDP_STAT 1, VSYS_STAT 0: 011 10 1 1 0.
+    let s = 0b01110110
+    test.assert_eq(bq25895.vbus_status(s), 3)
+    test.assert_eq(bq25895.chrg_status(s), 2)
+    test.assert(bq25895.power_good(s))
+    test.assert(not bq25895.power_good(0))
+    test.assert_eq(bq25895.vbus_status(0xE0), 7)
+    test.assert_eq(bq25895.chrg_status(0x18), 3)
+    let c = chip()
+    c.st.insert(60, s)
+    test.assert_eq(bq25895.status_read(dut(c)), s)
+    test.assert_eq(bq25895.status_read(dut(absent())), -1)
+
+@test
+fn test_the_fault_register_is_read_twice_and_alone() [io]
+    let c = chip()
+    let d = dut(c)
+    // A charge safety timer fault has gone since the last read.
+    set_faults(c, 0x30, 0x00)
+    log_clear(c)
+    let f = bq25895.faults_read(d) ?? Bq25895Faults { past: -1, now: -1 }
+    test.assert_eq(f.past, 0x30)
+    test.assert_eq(f.now, 0)
+    // Two transactions of one register each, never a burst.
+    test.assert(log_list(c) == [2, 0x0C, 1, 2, 0x0C, 1])
+    test.assert(bq25895.faults_read(dut(absent())) == None)
+    // The second read fails.
+    c.deaf.insert(0x0C, 1)
+    test.assert(bq25895.faults_read(d) == None)
+
+@test
+fn test_the_fault_bits_decode() [io]
+    test.assert(bq25895.fault_watchdog(0x80))
+    test.assert(not bq25895.fault_watchdog(0x7F))
+    test.assert(bq25895.fault_boost(0x40))
+    test.assert(not bq25895.fault_boost(0xBF))
+    test.assert_eq(bq25895.fault_charge(0x10), 1)
+    test.assert_eq(bq25895.fault_charge(0x20), 2)
+    test.assert_eq(bq25895.fault_charge(0x30), 3)
+    test.assert(bq25895.fault_battery(0x08))
+    test.assert(not bq25895.fault_battery(0xF7))
+    test.assert_eq(bq25895.fault_ntc(0x02), 2)
+    test.assert_eq(bq25895.fault_ntc(0x06), 6)
+
+@test
+fn test_the_charge_phase_follows_chrg_stat_and_a_fault_overrides() [io]
+    test.assert(bq25895.charge_state_of(0, false) == ChargeState.ChargeIdle)
+    test.assert(bq25895.charge_state_of(1, false) == ChargeState.ChargePrecharge)
+    test.assert(bq25895.charge_state_of(2, false) == ChargeState.ChargeConstantCurrent)
+    test.assert(bq25895.charge_state_of(3, false) == ChargeState.ChargeDone)
+    test.assert(bq25895.charge_state_of(2, true) == ChargeState.ChargeFault)
+    // From the part: precharge, then the same with each fault, then a past
+    // fault that has cleared.
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(60, 0x08)
+    set_faults(c, 0, 0)
+    test.assert(bq25895.charge_state(d) == ChargeState.ChargePrecharge)
+    for fault in [0x80, 0x10, 0x20, 0x30, 0x08, 0x01, 0x02]
+        set_faults(c, 0, fault)
+        test.assert(bq25895.charge_state(d) == ChargeState.ChargeFault)
+    set_faults(c, 0x30, 0)
+    test.assert(bq25895.charge_state(d) == ChargeState.ChargePrecharge)
+    // The boost fault does not stop a charge.
+    set_faults(c, 0, 0x40)
+    test.assert(bq25895.charge_state(d) == ChargeState.ChargePrecharge)
+    test.assert(bq25895.charge_state(dut(absent())) == ChargeState.ChargeIdle)
+    // The fault register does not answer.
+    c.deaf.insert(0x0C, 1)
+    test.assert(bq25895.charge_state(d) == ChargeState.ChargeIdle)
+
+@test
+fn test_the_power_source_is_the_input_or_the_cell() [io]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(60, 0x00)
+    test.assert(bq25895.source_read(d) == PowerSource.PowerBattery)
+    c.st.insert(60, 0x60)
+    test.assert(bq25895.source_read(d) == PowerSource.PowerUsb)
+    c.st.insert(60, 0x20)
+    test.assert(bq25895.source_read(d) == PowerSource.PowerUsb)
+    c.st.insert(60, 0xE0)
+    test.assert(bq25895.source_read(d) == PowerSource.PowerBattery)
+    test.assert(bq25895.source_read(dut(absent())) == PowerSource.PowerUnknown)
+
+// ── The battery monitor ──────────────────────────────────────────────
+
+@test
+fn test_a_one_shot_conversion_starts_with_conv_start_and_ends_when_it_clears() [io]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(80, 0)
+    test.assert(bq25895.adc_busy(d) == Some(false))
+    test.assert(bq25895.adc_start(d))
+    // CONV_START reads set for one read, then clear, and the results load.
+    test.assert(bq25895.adc_busy(d) == Some(true))
+    test.assert(bq25895.adc_busy(d) == Some(false))
+    let a = bq25895.adc_read(d) ?? Bq25895Adc { vbat_mv: 0, vsys_mv: 0, vbus_mv: 0, ts_milli_pct: 0, ichg_ma: 0, vbus_good: false }
+    test.assert_eq(a.vbat_mv, 4204)
+    test.assert_eq(a.vsys_mv, 4104)
+    test.assert_eq(a.vbus_mv, 5000)
+    test.assert_eq(a.ts_milli_pct, 21000 + 40 * 465)
+    test.assert_eq(a.ichg_ma, 1000)
+    test.assert(a.vbus_good)
+    // The five registers are read in one transaction from REG0E.
+    log_clear(c)
+    let _ = bq25895.adc_read(d)
+    test.assert(log_list(c) == [2, 0x0E, 5])
+    test.assert(bq25895.adc_busy(dut(absent())) == None)
+    test.assert(bq25895.adc_read(dut(absent())) == None)
+    test.assert(not bq25895.adc_start(dut(absent())))
+
+@test
+fn test_the_continuous_conversion_refuses_a_start() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq25895.adc_continuous(d, true))
+    test.assert_eq(reg(d, 0x02) & 0x40, 0x40)
+    test.assert(not bq25895.adc_start(d))
+    test.assert(bq25895.adc_continuous(d, false))
+    test.assert_eq(reg(d, 0x02) & 0x40, 0)
+    test.assert(bq25895.adc_start(d))
+    test.assert(not bq25895.adc_continuous(dut(absent()), true))
+
+@test
+fn test_a_measurement_waits_in_10_ms_pauses_for_the_conversion() [io]
+    let c = chip()
+    let d = dut(c)
+    // The conversion stays busy for 3 reads: three pauses of 10 ms.
+    c.st.insert(84, 3)
+    let a = bq25895.adc_measure(d, 100) ?? Bq25895Adc { vbat_mv: 0, vsys_mv: 0, vbus_mv: 0, ts_milli_pct: 0, ichg_ma: 0, vbus_good: false }
+    test.assert_eq(a.vbat_mv, 4204)
+    test.assert_eq(at(c.st, 91), 3)
+    test.assert_eq(at(c.st, 90), 30)
+    // Too few polls: not finished.
+    let e = chip()
+    test.assert(bq25895.adc_measure(dut(e), 0) == None)
+    // Never finishes.
+    let n = chip()
+    n.st.insert(81, 1)
+    test.assert(bq25895.adc_measure(dut(n), 5) == None)
+    test.assert_eq(at(n.st, 91), 5)
+    // Continuous: the latest, no wait.
+    let k = chip()
+    k.regs.insert(0x02, 0x7D)
+    k.regs.insert(0x0E, 95)
+    test.assert((bq25895.adc_measure(dut(k), 5) ?? a).vbat_mv == 4204)
+    test.assert_eq(at(k.st, 91), 0)
+    test.assert(bq25895.adc_measure(dut(absent()), 5) == None)
+    // The part stops answering after the start: the busy read fails (REG02
+    // is read by adc_measure, adc_start and adc_busy, the third read fails).
+    let m = chip()
+    m.st.insert(46, 3)
+    test.assert(bq25895.adc_measure(dut(m), 5) == None)
+    // The start is refused.
+    let r = chip()
+    r.st.insert(95, 1)
+    test.assert(bq25895.adc_measure(dut(r), 5) == None)
+
+@test
+fn test_the_battery_is_the_voltage_the_charge_current_the_phase_and_no_percent() [io]
+    let c = chip()
+    c.st.insert(60, 0x08)
+    set_faults(c, 0, 0)
+    let d = dut(c)
+    let b = bq25895.battery_read(d) ?? BatteryReading { voltage: MilliVolts { mv: 0 },
+        current: MilliAmps { ma: 0 },
+        charge: ChargeState.ChargeIdle,
+        percent: Some(0) }
+    test.assert_eq(b.voltage.mv, 4204)
+    test.assert_eq(b.current.ma, 1000)
+    test.assert(b.charge == ChargeState.ChargePrecharge)
+    test.assert(b.percent == None)
+    test.assert(bq25895.battery_read(dut(absent())) == None)
+
+// ── The boost mode and the rail ──────────────────────────────────────
+
+@test
+fn test_the_boost_output_sets_the_frequency_before_the_voltage() [io]
+    let c = chip()
+    let d = dut(c)
+    log_clear(c)
+    test.assert_eq(bq25895.boost_set(d, 5000, 1500), 4998)
+    // 1500 kHz clears BOOST_FREQ; BOOSTV is (5000 - 4550) / 64 = 7.
+    test.assert_eq(reg(d, 0x02) & 0x20, 0)
+    test.assert_eq(reg(d, 0x0A) >> 4, 7)
+    // The frequency is written before the voltage.
+    let l = log_list(c)
+    var order: [Int] = []
+    var i = 0
+    while i < l.len()
+        if l[i] == 1
+            list.push(order, l[i + 1])
+        i = i + 3
+    test.assert(order == [0x02, 0x0A])
+    // 500 kHz sets BOOST_FREQ; the low bits of REG0A stay.
+    test.assert_eq(bq25895.boost_set(d, 5510, 500), 5510)
+    test.assert_eq(reg(d, 0x02) & 0x20, 0x20)
+    test.assert_eq(reg(d, 0x0A), 0xF3)
+    test.assert_eq(bq25895.boost_voltage_get(d), 5510)
+    test.assert_eq(bq25895.boost_set(dut(absent()), 5000, 500), -1)
+    test.assert_eq(bq25895.boost_voltage_get(dut(absent())), -1)
+    // The voltage write is refused after the frequency was taken.
+    let m = chip()
+    m.mute.insert(0x0A, 1)
+    test.assert_eq(bq25895.boost_set(dut(m), 5000, 500), -1)
+
+@test
+fn test_the_boost_mode_is_otg_config_and_writes_wd_rst_as_zero() [io]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x03, 0x3A)
+    test.assert(bq25895.boost_enable(d, false))
+    test.assert_eq(reg(d, 0x03) & 0x20, 0)
+    test.assert(bq25895.boost_enable(d, true))
+    test.assert_eq(reg(d, 0x03) & 0x20, 0x20)
+    // The charge bit stays.
+    test.assert_eq(reg(d, 0x03) & 0x10, 0x10)
+    test.assert(not bq25895.boost_enable(dut(absent()), true))
+
+@test
+fn test_the_boost_output_is_the_one_rail() [io]
+    let c = chip()
+    let d = dut(c)
+    // Off: not enabled, and no OTG status.
+    c.regs.insert(0x03, 0x1A)
+    set_faults(c, 0, 0)
+    test.assert(bq25895.rail_state_of(d, 0) == RailState.RailOff)
+    test.assert(bq25895.rail_state_of(d, 1) == RailState.RailOff)
+    // On: OTG_CONFIG set and VBUS_STAT 7.
+    c.regs.insert(0x03, 0x3A)
+    c.st.insert(60, 0xE0)
+    test.assert(bq25895.rail_state_of(d, 0) == RailState.RailOn)
+    // Enabled and the status is not OTG yet: off.
+    c.st.insert(60, 0x00)
+    test.assert(bq25895.rail_state_of(d, 0) == RailState.RailOff)
+    // A boost fault.
+    set_faults(c, 0, 0x40)
+    test.assert(bq25895.rail_state_of(d, 0) == RailState.RailFault)
+    set_faults(c, 0, 0)
+    c.deaf.insert(0x0C, 1)
+    test.assert(bq25895.rail_state_of(d, 0) == RailState.RailOff)
+    c.deaf.insert(0x0C, 0)
+    // The voltage.
+    test.assert(bq25895.rail_voltage_of(d, 0) == Some(MilliVolts { mv: 5126 }))
+    test.assert(bq25895.rail_voltage_of(d, 1) == None)
+    test.assert(bq25895.rail_voltage_of(dut(absent()), 0) == None)
+    // Setting it takes the highest step at or below the request.
+    test.assert(bq25895.rail_set_voltage_of(d, 0, MilliVolts { mv: 5000 }) == Some(MilliVolts { mv: 4998 }))
+    test.assert_eq(reg(d, 0x0A) >> 4, 7)
+    test.assert(bq25895.rail_set_voltage_of(d, 0, MilliVolts { mv: 4000 }) == None)
+    test.assert(bq25895.rail_set_voltage_of(d, 1, MilliVolts { mv: 5000 }) == None)
+    test.assert(bq25895.rail_set_voltage_of(dut(absent()), 0, MilliVolts { mv: 5000 }) == None)
+
+// ── The ship mode ────────────────────────────────────────────────────
+
+@test
+fn test_the_ship_mode_forces_the_battery_fet_off_now_or_after_the_delay() [io]
+    let d = dut(chip())
+    test.assert(bq25895.ship_mode(d, false))
+    test.assert_eq(reg(d, 0x09) & 0x28, 0x20)
+    test.assert(bq25895.ship_mode(d, true))
+    test.assert_eq(reg(d, 0x09) & 0x28, 0x28)
+    test.assert(not bq25895.ship_mode(dut(absent()), false))
+
+// ── The awaitable INT line ───────────────────────────────────────────
+
+struct FakeEdge
+    seen: HashMap<Int, Int>
+    refuse: Int
+
+impl AsyncEdge[] for FakeEdge
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int
+        if self.refuse == 1
+            return -2
+        self.seen.insert(pin, edge)
+        0
+
+    fn edge_disarm(self, pin: Int) -> Bool
+        self.seen.insert(pin + 1000, 1)
+        true
+
+    fn edge_irqs(self) -> Int
+        0
+
+@test
+fn test_the_int_line_is_armed_for_a_falling_edge() [io, async]
+    let f = core.rt.future_new()
+    let e = FakeEdge { seen: HashMap.new(), refuse: 0 }
+    test.assert_eq(bq25895.int_arm(e, W, f), 0)
+    test.assert_eq(at(e.seen, 7), 1)
+    test.assert(bq25895.int_disarm(e, W))
+    test.assert_eq(at(e.seen, 1007), 1)
+    test.assert_eq(bq25895.int_arm(e, dev_bus.wiring_i2c(0, 0x6A), f), -1)
+    test.assert(not bq25895.int_disarm(e, dev_bus.wiring_i2c(0, 0x6A)))
+    test.assert_eq(bq25895.int_arm(FakeEdge { seen: HashMap.new(), refuse: 1 }, W, f), -2)
+    core.rt.future_drop(f)
+
+// ── The host scheduler's async form ──────────────────────────────────
+
+@test
+fn test_the_async_form_parks_until_the_conversion_ends() [io, hw, time, async]
+    let c = chip()
+    c.st.insert(60, 0x70 | 0x10)
+    set_faults(c, 0, 0)
+    let h = bq25895.host_of(dut(c))
+    let b = await h.battery_measure()
+    test.assert(b != None)
+    test.assert_eq((b ?? BatteryReading { voltage: MilliVolts { mv: 0 },
+        current: MilliAmps { ma: 0 },
+        charge: ChargeState.ChargeIdle,
+        percent: None }).voltage.mv,
+    4204)
+
+@test
+fn test_the_async_form_answers_none_where_the_part_does_not() [io, hw, time, async]
+    let a = bq25895.host_of(dut(absent()))
+    test.assert(await a.battery_measure() == None)
+    // The start is refused.
+    let r = chip()
+    r.st.insert(95, 1)
+    let rh = bq25895.host_of(dut(r))
+    test.assert(await rh.battery_measure() == None)
+    // The part stops answering during the wait: REG02 is read by the form,
+    // by adc_start and by adc_busy.
+    let m = chip()
+    m.st.insert(46, 3)
+    m.st.insert(81, 1)
+    let mh = bq25895.host_of(dut(m))
+    test.assert(await mh.battery_measure() == None)
+    // The conversion never finishes: the readings are taken anyway after
+    // the polls.
+    let n = chip()
+    n.st.insert(81, 1)
+    let nh = bq25895.host_of(dut(n))
+    test.assert(await nh.battery_measure() != None)
+    // Continuous: no start.
+    let k = chip()
+    k.regs.insert(0x02, 0x7D)
+    k.regs.insert(0x0E, 95)
+    let kh = bq25895.host_of(dut(k))
+    test.assert(await kh.battery_measure() != None)
+    // The readings cannot be read.
+    let e = chip()
+    e.deaf.insert(0x0E, 1)
+    e.regs.insert(0x02, 0x7D)
+    let eh = bq25895.host_of(dut(e))
+    test.assert(await eh.battery_measure() == None)
+
+// ── The part on a board's handles ────────────────────────────────────
+
+@test
+fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
+    // The host's board handles drive no hardware: every read fails.
+    let g = Bq25895.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert(not g.begin())
+    g.pause_ms(1)
+    test.assert(not g.reset_all())
+    test.assert(not g.set_charging(true))
+    test.assert_eq(g.set_charge_current(1024), -1)
+    test.assert_eq(g.set_charge_voltage(4208), -1)
+    test.assert_eq(g.set_precharge_current(128), -1)
+    test.assert_eq(g.set_termination_current(256), -1)
+    test.assert_eq(g.set_input_current(1500), -1)
+    test.assert_eq(g.input_current(), -1)
+    test.assert(not g.feed_watchdog())
+    test.assert(g.faults() == None)
+    test.assert(g.charge() == ChargeState.ChargeIdle)
+    test.assert(g.measure() == None)
+    test.assert_eq(g.set_boost(5000, 500), -1)
+    test.assert(not g.enable_boost(true))
+    test.assert_eq(g.int_level(), 0)
+    // The PowerManager of a charger: the boost output is the one rail.
+    test.assert_eq(g.rail_count(), 1)
+    test.assert(g.rail_state(0) == RailState.RailOff)
+    test.assert(g.rail_voltage(0) == None)
+    test.assert(g.rail_set_voltage(0, MilliVolts { mv: 5000 }) == None)
+    test.assert(not g.rail_enable(0, true))
+    test.assert(not g.rail_enable(1, true))
+    test.assert(g.battery() == None)
+    test.assert(g.power_source() == PowerSource.PowerUnknown)
+    test.assert(g.device_id() == None)
+    test.assert(not g.device_probe(7))

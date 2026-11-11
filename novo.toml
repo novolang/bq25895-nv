@@ -1,0 +1,24 @@
+[package]
+name        = "bq25895-nv"
+version     = "0.1.0"
+description = "A driver for TI's BQ25895 single-cell I2C fast charger on an I2C bus: the input current and voltage limits, the fast charge, precharge and termination currents, the charge voltage and recharge threshold, the watchdog and the safety timer, the status and the fault register read twice, the battery monitor's ADC readings, the boost mode as configuration, the ship mode and the device identity, as the charger side of devices-nv's PowerManager and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["bq25895", "charger", "battery", "pmic", "i2c", "boost", "ti", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/bq25895-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Reading and configuring a BQ25895 charger from a device program"
+
+[dependencies]
+# The board's I2C bus, timer and GPIO handles, the I2cBus, Timer and
+# GpioOut traits they implement, and the pin-edge trait of the awaitable
+# INT line.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the PowerManager and Identifiable traits.
+devices-nv      = "^0.3.3"

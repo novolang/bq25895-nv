@@ -1,0 +1,68 @@
+// device_read — a charger monitor for a BQ25895 on a breakout, for an
+// nRF52840 DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and the charger
+// answers at 0x6A.  The cell is a single lithium cell of 2000 mAh.  The
+// program checks the part number in REG14 and disables the watchdog
+// (`begin`), limits the input to 1500 mA and the fast charge to 1024 mA at
+// 4208 mV, turns the charge on, and once a second runs the battery monitor
+// and prints one line over RTT:
+//
+//     bq25895 mV=<battery> mA=<charge current> phase=<0 to 5> fault=<REG0C>
+//
+// The phase is 0 idle, 1 precharge, 2 constant current, 3 constant voltage,
+// 4 done, 5 fault, the order of devices-nv's `ChargeState`.  The charge
+// current is positive while the cell charges.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use dev_bus
+use dev_power.{ ChargeState }
+use bq25895
+use bq25895.{ Bq25895 }
+
+// The charger's address.
+const ADDR = 0x6A
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+// The number a phase prints as.
+fn phase_number(s: ChargeState) -> Int
+    match s
+        ChargeState.ChargeIdle            => 0
+        ChargeState.ChargePrecharge       => 1
+        ChargeState.ChargeConstantCurrent => 2
+        ChargeState.ChargeConstantVoltage => 3
+        ChargeState.ChargeDone            => 4
+        ChargeState.ChargeFault           => 5
+
+@tier(embedded)
+fn main() [hw]
+    let charger = Bq25895.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(50)
+    if not charger.begin()
+        hal.uart.write("bq25895: no answer\n")
+        return
+    let _ = charger.set_input_current(1500)
+    let _ = charger.set_charge_current(1024)
+    let _ = charger.set_charge_voltage(4208)
+    let _ = charger.set_charging(true)
+    loop
+        match charger.measure()
+            Some(a) =>
+                hal.uart.write("bq25895")
+                field(" mV=", a.vbat_mv)
+                field(" mA=", a.ichg_ma)
+                field(" phase=", phase_number(charger.charge()))
+                match charger.faults()
+                    Some(f) => field(" fault=", f.now)
+                    None    => hal.uart.write(" fault=?")
+                hal.uart.write("\n")
+            None    =>
+                hal.uart.write("bq25895: no result\n")
+        hal.timer.delay_ms(1000)
