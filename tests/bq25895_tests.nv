@@ -56,6 +56,20 @@ fn log_list(c: Chip) -> [Int]
 fn log_clear(c: Chip)
     c.st.insert(99, 0)
 
+// The value of the last write to `r` in a log, or -1 when `r` was not
+// written.  A log entry is a triple (kind, register, value), and kind 1
+// is a write.
+fn last_write_to(l: [Int], r: Int) -> Int
+    list.fold(list.range(0, l.len() / 3),
+        (last, k) => (if l[3 * k] == 1 and l[3 * k + 1] == r then l[3 * k + 2] else last),
+        -1)
+
+// The registers written in a log, in the order of the writes.
+fn registers_written(l: [Int]) -> [Int]
+    let none: [Int] = []
+    list.flat_map(list.range(0, l.len() / 3),
+        k => (if l[3 * k] == 1 then [l[3 * k + 1]] else none))
+
 // The registers at their reset values (Tables 8-8 to 8-28).
 fn defaults(c: Chip)
     c.regs.insert(0x00, 0x48)
@@ -520,12 +534,7 @@ fn test_the_optimizer_and_the_detection_settings_never_write_conv_start() [io]
     log_clear(c)
     test.assert(bq25895.ico_set(d, false))
     let l = log_list(c)
-    var wrote = -1
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] == 0x02
-            wrote = l[i + 2]
-        i = i + 3
+    let wrote = last_write_to(l, 0x02)
     test.assert_eq(wrote & 0x80, 0)
     c.st.insert(80, 0)
     test.assert(bq25895.detection_set(d, false, false, false))
@@ -561,12 +570,7 @@ fn test_the_charge_enable_and_the_minimum_system_voltage_share_reg03() [io]
     log_clear(c)
     test.assert(bq25895.charge_enable(d, true))
     let l = log_list(c)
-    var wrote = -1
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] == 0x03
-            wrote = l[i + 2]
-        i = i + 3
+    let wrote = last_write_to(l, 0x03)
     test.assert_eq(wrote & 0x40, 0)
     test.assert(not bq25895.charge_enable(dut(absent()), true))
     test.assert_eq(bq25895.sysmin_set(dut(absent()), 3500), -1)
@@ -849,13 +853,7 @@ fn test_the_boost_output_sets_the_frequency_before_the_voltage() [io]
     test.assert_eq(reg(d, 0x0A) >> 4, 7)
     // The frequency is written before the voltage.
     let l = log_list(c)
-    var order: [Int] = []
-    var i = 0
-    while i < l.len()
-        if l[i] == 1
-            list.push(order, l[i + 1])
-        i = i + 3
-    test.assert(order == [0x02, 0x0A])
+    test.assert(registers_written(l) == [0x02, 0x0A])
     // 500 kHz sets BOOST_FREQ; the low bits of REG0A stay.
     test.assert_eq(bq25895.boost_set(d, 5510, 500), 5510)
     test.assert_eq(reg(d, 0x02) & 0x20, 0x20)
