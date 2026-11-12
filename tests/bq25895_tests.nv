@@ -15,7 +15,7 @@
 // stays busy for (1 when 0), 82 the reads of REG14 that
 // REG_RST stays set for, 83 is 1 when a reset never finishes, 46 is 1 more
 // than the reads of REG02 after which the part stops answering it and 47 the
-// reads made, 90 the milliseconds paused, 91 the pauses, 95 is 1 more than
+// reads made, 90 the milliseconds waited on the bus, 91 the waits, 95 is 1 more than
 // the writes after which every write is refused (0 for no limit) and 96 the
 // writes made, 99 the entries in the log.  The log is: a register written
 // is 1, the register and the value; a register read is 2, the first
@@ -23,9 +23,9 @@
 
 use std.test
 use core.rt
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, AsyncEdge }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerSource, PowerManager, PowerManagerAsync }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, BatteryHealth, PowerSource, PowerManager, PowerManagerAsync }
 use dev_id.{ DeviceId, Identifiable }
 use bq25895
 use bq25895.{ Bq25895, Bq25895Port, Bq25895Adc, Bq25895Faults, Bq25895Host }
@@ -180,6 +180,11 @@ impl I2cBus for FakeI2c
     fn init(self, freq: Int) [hw]
         self.c.st.insert(29, freq)
 
+    // The bus waits for the driver: the waits are counted, not spent.
+    fn delay_ms(self, ms: Int) [hw]
+        self.c.st.insert(90, at(self.c.st, 90) + ms)
+        self.c.st.insert(91, at(self.c.st, 91) + 1)
+
     fn write(self, addr: Int, data: [u8]) -> Bool [hw]
         if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0 or data.len() < 2
             return false
@@ -237,7 +242,7 @@ impl GpioOut for FakePins
 let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x6A), 7)
 
 // The port: every method is the package's own function over the double; the
-// pauses are counted.
+// pauses are the bus's waits, which the double counts.
 struct Dut
     bus: FakeI2c
     pins: FakePins
@@ -254,8 +259,7 @@ impl Bq25895Port for Dut
         bq25895.i2c_write(self.bus, self.w, reg, v)
 
     fn pause_ms(self, ms: Int) [hw]
-        self.bus.c.st.insert(90, at(self.bus.c.st, 90) + ms)
-        self.bus.c.st.insert(91, at(self.bus.c.st, 91) + 1)
+        self.bus.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
         bq25895.irq_level_of(self.pins, self.w)
@@ -617,6 +621,80 @@ fn test_the_currents_and_the_voltage_are_set_and_read_by_field() [io]
     test.assert_eq(bq25895.charge_voltage_get(a), -1)
 
 @test
+fn test_the_charger_limits_are_the_power_manager_s_and_never_round_up() [io]
+    let d = dut(chip())
+    // PowerManager.charge_current and charge_set_current: 64 mA a step, the
+    // step at or below the request.
+    test.assert_eq((bq25895.charge_current_of(d) ?? MilliAmps { ma: -1 }).ma, 2048)
+    test.assert_eq((bq25895.charge_set_current_of(d, MilliAmps { ma: 1100 }) ?? MilliAmps { ma: -1 }).ma, 1088)
+    test.assert_eq(reg(d, 0x04), 17)
+    test.assert_eq((bq25895.charge_current_of(d) ?? MilliAmps { ma: -1 }).ma, 1088)
+    // A request of 63 mA is below the first step and sets 0, which is a step
+    // of the field; a negative request is refused.
+    test.assert_eq((bq25895.charge_set_current_of(d, MilliAmps { ma: 63 }) ?? MilliAmps { ma: -1 }).ma, 0)
+    test.assert(bq25895.charge_set_current_of(d, MilliAmps { ma: -1 }) == None)
+    test.assert_eq((bq25895.charge_set_current_of(d, MilliAmps { ma: 9000 }) ?? MilliAmps { ma: -1 }).ma, 5056)
+    // The charge voltage limit: 16 mV a step from 3840 mV, never above the
+    // request, and a request below 3840 mV is refused, not raised.
+    test.assert_eq((bq25895.charge_voltage_limit_of(d) ?? MilliVolts { mv: -1 }).mv, 4208)
+    test.assert_eq((bq25895.charge_set_voltage_limit_of(d, MilliVolts { mv: 4350 }) ?? MilliVolts { mv: -1 }).mv,
+        4336)
+    test.assert_eq((bq25895.charge_voltage_limit_of(d) ?? MilliVolts { mv: -1 }).mv, 4336)
+    test.assert_eq((bq25895.charge_set_voltage_limit_of(d, MilliVolts { mv: 3840 }) ?? MilliVolts { mv: -1 }).mv,
+        3840)
+    test.assert(bq25895.charge_set_voltage_limit_of(d, MilliVolts { mv: 3839 }) == None)
+    test.assert_eq((bq25895.charge_set_voltage_limit_of(d, MilliVolts { mv: 9000 }) ?? MilliVolts { mv: -1 }).mv,
+        4608)
+    test.assert_eq(reg(d, 0x06) & 0x03, 0x02)
+    // The input current limit register: 50 mA a step from 100 mA, the step
+    // at or below the request; below 100 mA is refused.
+    test.assert_eq((bq25895.input_current_limit_of(d) ?? MilliAmps { ma: -1 }).ma, 500)
+    test.assert_eq((bq25895.input_set_current_limit_of(d, MilliAmps { ma: 1520 }) ?? MilliAmps { ma: -1 }).ma,
+        1500)
+    test.assert_eq((bq25895.input_current_limit_of(d) ?? MilliAmps { ma: -1 }).ma, 1500)
+    test.assert_eq((bq25895.input_set_current_limit_of(d, MilliAmps { ma: 100 }) ?? MilliAmps { ma: -1 }).ma, 100)
+    test.assert(bq25895.input_set_current_limit_of(d, MilliAmps { ma: 99 }) == None)
+    test.assert_eq((bq25895.input_set_current_limit_of(d, MilliAmps { ma: 9000 }) ?? MilliAmps { ma: -1 }).ma,
+        3250)
+    // A part that does not answer, and a write it refuses.
+    let a = dut(absent())
+    test.assert(bq25895.charge_current_of(a) == None)
+    test.assert(bq25895.charge_set_current_of(a, MilliAmps { ma: 1024 }) == None)
+    test.assert(bq25895.charge_voltage_limit_of(a) == None)
+    test.assert(bq25895.charge_set_voltage_limit_of(a, MilliVolts { mv: 4200 }) == None)
+    test.assert(bq25895.input_current_limit_of(a) == None)
+    test.assert(bq25895.input_set_current_limit_of(a, MilliAmps { ma: 500 }) == None)
+
+@test
+fn test_the_battery_health_is_the_fault_registers_battery_and_thermistor_bits() [io]
+    let c = chip()
+    let d = dut(c)
+    set_faults(c, 0, 0)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthGood)
+    // BAT_FAULT, battery over-voltage.
+    set_faults(c, 0, 0x08)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthOvervoltage)
+    // NTC_FAULT in buck mode: 1 cold, 2 hot; in boost mode 5 cold, 6 hot.
+    set_faults(c, 0, 0x01)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthCold)
+    set_faults(c, 0, 0x05)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthCold)
+    set_faults(c, 0, 0x02)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthOverheat)
+    set_faults(c, 0, 0x06)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthOverheat)
+    // A code the data sheet does not give.
+    set_faults(c, 0, 0x03)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthFault)
+    // A fault that has gone since the last read is the past, not the present.
+    set_faults(c, 0x08, 0)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthGood)
+    // The charger's own faults are not the battery's.
+    set_faults(c, 0, 0x20)
+    test.assert(bq25895.battery_health_of(d) == BatteryHealth.HealthGood)
+    test.assert(bq25895.battery_health_of(dut(absent())) == BatteryHealth.HealthUnknown)
+
+@test
 fn test_the_thresholds_the_termination_and_the_timers() [io]
     let d = dut(chip())
     test.assert(bq25895.recharge_threshold_set(d, 200))
@@ -713,7 +791,9 @@ fn test_the_fault_bits_decode() [io]
 fn test_the_charge_phase_follows_chrg_stat_and_a_fault_overrides() [io]
     test.assert(bq25895.charge_state_of(0, false) == ChargeState.ChargeIdle)
     test.assert(bq25895.charge_state_of(1, false) == ChargeState.ChargePrecharge)
-    test.assert(bq25895.charge_state_of(2, false) == ChargeState.ChargeConstantCurrent)
+    // The fast charge is one phase for the part: constant current and constant
+    // voltage are not told apart.
+    test.assert(bq25895.charge_state_of(2, false) == ChargeState.ChargeActive)
     test.assert(bq25895.charge_state_of(3, false) == ChargeState.ChargeDone)
     test.assert(bq25895.charge_state_of(2, true) == ChargeState.ChargeFault)
     // From the part: precharge, then the same with each fault, then a past
@@ -1013,16 +1093,22 @@ fn test_the_async_form_answers_none_where_the_part_does_not() [io, hw, time, asy
 @test
 fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
     // The host's board handles drive no hardware: every read fails.
-    let g = Bq25895.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, W)
+    let g = Bq25895.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
     test.assert(not g.begin())
     g.pause_ms(1)
     test.assert(not g.reset_all())
     test.assert(not g.set_charging(true))
-    test.assert_eq(g.set_charge_current(1024), -1)
-    test.assert_eq(g.set_charge_voltage(4208), -1)
+    test.assert(g.charge_set_current(MilliAmps { ma: 1024 }) == None)
+    test.assert(g.charge_set_voltage_limit(MilliVolts { mv: 4208 }) == None)
     test.assert_eq(g.set_precharge_current(128), -1)
     test.assert_eq(g.set_termination_current(256), -1)
-    test.assert_eq(g.set_input_current(1500), -1)
+    test.assert(g.input_set_current_limit(MilliAmps { ma: 1500 }) == None)
+    test.assert(g.charge_current() == None)
+    test.assert(g.charge_voltage_limit() == None)
+    test.assert(g.input_current_limit() == None)
+    test.assert(g.battery_health() == BatteryHealth.HealthUnknown)
+    test.assert(g.battery_capacity() == None)
+    test.assert(g.battery_temperature() == None)
     test.assert_eq(g.input_current(), -1)
     test.assert(not g.feed_watchdog())
     test.assert(g.faults() == None)

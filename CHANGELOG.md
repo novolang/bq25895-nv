@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `set_charge_current`, `set_charge_voltage` and `set_input_current` on
+  `Bq25895` are gone.  `PowerManager.charge_set_current`,
+  `charge_set_voltage_limit` and `input_set_current_limit` replace them, with
+  the getters `charge_current`, `charge_voltage_limit` and
+  `input_current_limit`.  They answer `Option`, not `-1`, and set the step at or
+  below the request: a request below the field's range (a negative current,
+  under 100 mA for the input limit, under 3840 mV for the charge voltage)
+  answers `None` where the package functions raised it to the bottom of the
+  range.  `input_current()` stays, the limit in effect.
+- `charge_state_of` and `charge()` answer `ChargeActive` for the fast charge,
+  where 0.1.0 answered `ChargeConstantCurrent`, a phase the part cannot
+  identify.
+- `battery_health()` answers `HealthOvervoltage` for BAT_FAULT, `HealthCold` and
+  `HealthOverheat` for a cold or hot thermistor, `HealthFault` for any other NTC
+  code and `HealthGood` otherwise.
+- `attach(bus, pins, w)` has no `BoardTimer`: the waits go through
+  `I2cBus.delay_ms`.
+
 ## 0.1.0
 
 The first release: a driver for TI's BQ25895 single-cell I2C fast charger.

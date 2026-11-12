@@ -88,9 +88,9 @@
 // sheet.  Each fix kept is named at its site.
 
 use core.rt
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, Timer, AsyncEdge }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerSource, PowerManager, PowerManagerAsync }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, BatteryHealth, PowerSource, PowerManager, PowerManagerAsync }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
@@ -745,16 +745,16 @@ pub fn fault_ntc(r: Int) -> Int
 
 // The phase `PowerManager` names for a charging status and a fault: a
 // fault is `ChargeFault`; 0 is `ChargeIdle`, 1 `ChargePrecharge`, 2
-// `ChargeConstantCurrent` (the part's fast charge is the constant current
-// and the constant voltage phases, and its registers do not tell them
-// apart) and 3 `ChargeDone`.
+// `ChargeActive` (the part's fast charge is the constant current and the
+// constant voltage phases, and its registers do not tell them apart) and 3
+// `ChargeDone`.
 pub fn charge_state_of(chrg: Int, faulted: Bool) -> ChargeState
     if faulted
         return ChargeState.ChargeFault
     if chrg == 1
         return ChargeState.ChargePrecharge
     if chrg == 2
-        return ChargeState.ChargeConstantCurrent
+        return ChargeState.ChargeActive
     if chrg == 3
         return ChargeState.ChargeDone
     ChargeState.ChargeIdle
@@ -938,8 +938,93 @@ pub fn rail_set_voltage_of<P: Bq25895Port>(p: P, rail: Int, v: MilliVolts) -> ?M
         return Some(step)
     None
 
+// The battery's condition from REG0C's present state: a battery
+// over-voltage (BAT_FAULT) is `HealthOvervoltage`, an NTC fault of a cold
+// thermistor is `HealthCold` and of a hot one `HealthOverheat` (1 and 2 in
+// buck mode, 5 and 6 in boost mode), any other NTC code is `HealthFault`,
+// and a register without those faults is `HealthGood`.  `HealthUnknown`
+// when the part does not answer.  The part has no flag for a dead cell, so
+// `HealthDead` is never answered.
+pub fn battery_health_of<P: Bq25895Port>(p: P) -> BatteryHealth [hw]
+    let Some(f) = faults_read(p) else return BatteryHealth.HealthUnknown
+    if fault_battery(f.now)
+        return BatteryHealth.HealthOvervoltage
+    let ntc = fault_ntc(f.now)
+    if ntc == 1 or ntc == 5
+        return BatteryHealth.HealthCold
+    if ntc == 2 or ntc == 6
+        return BatteryHealth.HealthOverheat
+    if ntc != 0
+        return BatteryHealth.HealthFault
+    BatteryHealth.HealthGood
+
+// The fast charge current, `PowerManager.charge_current`: the constant
+// current of the main phase, or `None` when the part did not answer.
+pub fn charge_current_of<P: Bq25895Port>(p: P) -> ?MilliAmps [hw]
+    let ma = charge_current_get(p)
+    if ma < 0
+        return None
+    Some(MilliAmps { ma: ma })
+
+// Sets the fast charge current to the step of 64 mA at or below the
+// request, `PowerManager.charge_set_current`, and answers the current set.
+// `None` for a negative request and for a refused write.
+pub fn charge_set_current_of<P: Bq25895Port>(p: P, i: MilliAmps) -> ?MilliAmps [hw]
+    if i.ma < 0
+        return None
+    let ma = charge_current_set(p, i.ma)
+    if ma < 0
+        return None
+    Some(MilliAmps { ma: ma })
+
+// The charge voltage, `PowerManager.charge_voltage_limit`, or `None` when
+// the part did not answer.
+pub fn charge_voltage_limit_of<P: Bq25895Port>(p: P) -> ?MilliVolts [hw]
+    let mv = charge_voltage_get(p)
+    if mv < 0
+        return None
+    Some(MilliVolts { mv: mv })
+
+// Sets the charge voltage to the step of 16 mV at or below the request,
+// `PowerManager.charge_set_voltage_limit`, and answers the voltage set.  A
+// request above 4608 mV sets 4608 mV, the part's top.  `None` for a request
+// below 3840 mV, which `charge_voltage_set` would raise to 3840 mV, and for
+// a refused write; the voltage is never set above the request.
+pub fn charge_set_voltage_limit_of<P: Bq25895Port>(p: P, v: MilliVolts) -> ?MilliVolts [hw]
+    if v.mv < 3840
+        return None
+    let mv = charge_voltage_set(p, v.mv)
+    if mv < 0
+        return None
+    Some(MilliVolts { mv: mv })
+
+// The input current limit register, `PowerManager.input_current_limit`, or
+// `None` when the part did not answer.  The limit in effect, which follows
+// input source detection, is `input_current_effective`.
+pub fn input_current_limit_of<P: Bq25895Port>(p: P) -> ?MilliAmps [hw]
+    let ma = input_current_get(p)
+    if ma < 0
+        return None
+    Some(MilliAmps { ma: ma })
+
+// Sets the input current limit to the step of 50 mA at or below the
+// request, `PowerManager.input_set_current_limit`, and answers the limit
+// set.  `None` for a request below 100 mA, which `input_current_set` would
+// raise to 100 mA, and for a refused write; a request above 3250 mA sets
+// 3250 mA.
+pub fn input_set_current_limit_of<P: Bq25895Port>(p: P, i: MilliAmps) -> ?MilliAmps [hw]
+    if i.ma < 100
+        return None
+    let ma = input_current_set(p, i.ma)
+    if ma < 0
+        return None
+    Some(MilliAmps { ma: ma })
+
 // ── The awaitable INT line ───────────────────────────────────────────
 
+// Stays a package function (planning page 3.5, the AsyncDeviceReady row):
+// no board's `BoardGpio` implements `AsyncEdge`, so a board driver cannot
+// implement `AsyncDeviceReady`.
 // Arms the INT pin on a pin-edge source: the Future `f` resolves with the
 // level captured when the line falls, which is the start of the part's
 // 256 us pulse for a source identified, a good input, an input removed, a
@@ -961,11 +1046,11 @@ pub fn int_disarm<E: AsyncEdge[e]>(edge: E, w: DeviceWiring) -> Bool [e]
 // ── The part on a board ──────────────────────────────────────────────
 
 // A BQ25895 on a board's I2C bus at the address `w.addr`, 0x6A, with the
-// board's timer for the waits and its GPIO for the INT line.
+// bus for the waits (`I2cBus.delay_ms`) and the board's GPIO for the INT
+// line.
 pub @value
 struct Bq25895
     bus: BoardI2c
-    timer: BoardTimer
     pins: BoardGpio
     w: DeviceWiring
 
@@ -980,7 +1065,7 @@ impl Bq25895Port for Bq25895
         i2c_write(self.bus, self.w, reg, v)
 
     fn pause_ms(self, ms: Int) [hw]
-        self.timer.delay_ms(ms)
+        self.bus.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
         irq_level_of(self.pins, self.w)
@@ -988,8 +1073,8 @@ impl Bq25895Port for Bq25895
 impl Bq25895
     // The part at `w.addr` on the board's bus, as a board's device table
     // builds it.  Nothing is sent.
-    fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Bq25895
-        Bq25895 { bus: bus, timer: timer, pins: pins, w: w }
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Bq25895
+        Bq25895 { bus: bus, pins: pins, w: w }
 
     // Makes the bus ready, checks the part number and disables the
     // watchdog (`start`).
@@ -1004,14 +1089,6 @@ impl Bq25895
     fn set_charging(self, on: Bool) -> Bool [hw]
         charge_enable(self, on)
 
-    // Sets the fast charge current in milliamps; answers the current set.
-    fn set_charge_current(self, ma: Int) -> Int [hw]
-        charge_current_set(self, ma)
-
-    // Sets the charge voltage in millivolts; answers the voltage set.
-    fn set_charge_voltage(self, mv: Int) -> Int [hw]
-        charge_voltage_set(self, mv)
-
     // Sets the precharge and the termination current in milliamps.
     fn set_precharge_current(self, ma: Int) -> Int [hw]
         precharge_current_set(self, ma)
@@ -1019,11 +1096,8 @@ impl Bq25895
     fn set_termination_current(self, ma: Int) -> Int [hw]
         termination_current_set(self, ma)
 
-    // Sets the input current limit in milliamps; answers the limit set.
-    fn set_input_current(self, ma: Int) -> Int [hw]
-        input_current_set(self, ma)
-
-    // The input current limit in effect.
+    // The input current limit in effect, which follows input source
+    // detection; `PowerManager.input_current_limit` is the register.
     fn input_current(self) -> Int [hw]
         input_current_effective(self)
 
@@ -1084,6 +1158,32 @@ impl PowerManager[hw] for Bq25895
     fn power_source(self) -> PowerSource [hw]
         source_read(self)
 
+    fn charge_current(self) -> ?MilliAmps [hw]
+        charge_current_of(self)
+
+    fn charge_set_current(self, i: MilliAmps) -> ?MilliAmps [hw]
+        charge_set_current_of(self, i)
+
+    fn charge_voltage_limit(self) -> ?MilliVolts [hw]
+        charge_voltage_limit_of(self)
+
+    fn charge_set_voltage_limit(self, v: MilliVolts) -> ?MilliVolts [hw]
+        charge_set_voltage_limit_of(self, v)
+
+    fn input_current_limit(self) -> ?MilliAmps [hw]
+        input_current_limit_of(self)
+
+    fn input_set_current_limit(self, i: MilliAmps) -> ?MilliAmps [hw]
+        input_set_current_limit_of(self, i)
+
+    // From the fault register: over-voltage, cold and hot thermistor.
+    fn battery_health(self) -> BatteryHealth [hw]
+        battery_health_of(self)
+
+// battery_capacity and battery_temperature keep the trait's bodies: a
+// charger has no gauge, and its thermistor is read as a percent of REGN,
+// not as a temperature.
+
 impl Identifiable[hw] for Bq25895
     // The part number field of REG14, 7, with the device revision as `rev`.
     fn device_id(self) -> ?DeviceId [hw]
@@ -1091,6 +1191,10 @@ impl Identifiable[hw] for Bq25895
 
 // ── The host scheduler's async form ──────────────────────────────────
 
+// Stays as it is (planning page 3.5, the `*Async` row): an `async fn` takes
+// no `@value` struct and the embedded tier refuses it, so this is a plain
+// struct with an `@tier(app)` impl.
+//
 // A part on the host scheduler, which implements `PowerManagerAsync`:
 // `battery_measure` starts a conversion, parks the task 10 ms at a time
 // until the part clears CONV_START (at most 120 times), and answers the

@@ -25,12 +25,14 @@ breakout's SDA and SCL go to the board's I2C pins and the charger answers at
 limits the input to 1500 mA and the fast charge to 1024 mA at 4208 mV,
 turns the charge on, and once a second runs the battery monitor and prints
 one line over RTT.  The phase is 0 idle, 1 precharge, 2 constant current, 3
-constant voltage, 4 done and 5 fault.
+constant voltage, 4 done, 5 fault and 6 charging (the part's fast charge,
+which it does not split into the constant current and constant voltage
+phases).
 
 ```novo norun:needs-pkg
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use embedded_hal.{ BoardI2c, BoardGpio }
 use dev_bus
-use dev_power.{ ChargeState }
+use dev_power.{ ChargeState, MilliAmps, MilliVolts, PowerManager }
 use bq25895
 use bq25895.{ Bq25895 }
 
@@ -51,17 +53,18 @@ fn phase_number(s: ChargeState) -> Int
         ChargeState.ChargeConstantVoltage => 3
         ChargeState.ChargeDone            => 4
         ChargeState.ChargeFault           => 5
+        ChargeState.ChargeActive          => 6
 
 @tier(embedded)
 fn main() [hw]
-    let charger = Bq25895.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let charger = Bq25895.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
     hal.timer.delay_ms(50)
     if not charger.begin()
         hal.uart.write("bq25895: no answer\n")
         return
-    let _ = charger.set_input_current(1500)
-    let _ = charger.set_charge_current(1024)
-    let _ = charger.set_charge_voltage(4208)
+    let _ = charger.input_set_current_limit(MilliAmps { ma: 1500 })
+    let _ = charger.charge_set_current(MilliAmps { ma: 1024 })
+    let _ = charger.charge_set_voltage_limit(MilliVolts { mv: 4208 })
     let _ = charger.set_charging(true)
     loop
         match charger.measure()
@@ -115,7 +118,7 @@ functions of devices-nv build one short frame per transaction inside a
 every tier, `embedded` included; the exceptions are the host-scheduler
 async impl at the end of the module, which carries `@tier(app)`, and
 `int_arm`, which takes the effect of the pin-edge source it is handed.  The
-waits are the port's: the board's type waits with its timer, `[hw]`.
+waits are the port's: the board's type waits through its bus, `[hw]`.
 
 ## What it is
 
@@ -159,17 +162,21 @@ REG0C.
 ## How to choose an entry point
 
 A program on a board uses `Bq25895`.  It is built by `attach` with the
-board's bus, its timer, its GPIO and the wiring, as a board's device table
-builds it.  It implements `PowerManager` (the charger side) and
+board's bus, its GPIO and the wiring, as a board's device table builds it.
+The waits go through the bus (`I2cBus.delay_ms`), so there is no timer slot.  It implements `PowerManager` (the charger side) and
 `Identifiable`.
 
 | Method | What it does |
 |---|---|
-| `attach(bus, timer, pins, w)` | the part at `w.addr`; nothing is sent |
+| `attach(bus, pins, w)` | the part at `w.addr`; nothing is sent |
 | `begin()` | makes the bus ready, checks the part number and disables the watchdog |
-| `set_charging(on)`, `set_charge_current(ma)`, `set_charge_voltage(mv)` | the charge; the last two answer the value set, in milliamps and millivolts |
+| `set_charging(on)` | the charge on or off |
+| `charge_current()`, `charge_set_current(i)` | `PowerManager`: the fast charge current, the step at or below the request |
+| `charge_voltage_limit()`, `charge_set_voltage_limit(v)` | `PowerManager`: the charge voltage, the step at or below the request |
+| `input_current_limit()`, `input_set_current_limit(i)` | `PowerManager`: the input limit register, the step at or below the request |
 | `set_precharge_current(ma)`, `set_termination_current(ma)` | the two currents that bound the charge |
-| `set_input_current(ma)`, `input_current()` | the input limit set, and the limit in effect |
+| `input_current()` | the input limit in effect, which follows input source detection |
+| `battery_health()` | `PowerManager`: over-voltage, cold or hot thermistor from REG0C, else good |
 | `measure()` | one battery monitor conversion, waited for, and its five readings |
 | `battery()` | `PowerManager`: the battery voltage and the charge current after one conversion, the phase, no percent |
 | `charge()`, `faults()` | the phase now, and the faults since the last read and the present ones |
@@ -186,11 +193,14 @@ methods: the safety timer, the thresholds, the optimizer, the detections,
 the continuous conversion, the ship mode and the absolute input voltage
 limit.
 
-The `PowerManager` trait has no charger current or charge voltage limit, so
-the limits are the package's own functions (`charge_current_set`,
-`charge_voltage_set`, `input_current_set`) beside the trait.  Every setter
-answers the value the part holds, rounded down to the step of the field,
-and `-1` when the part did not take it.
+The charger's limits are `PowerManager` methods.  A setter sets the step of
+the field at or below the request and answers the value the part holds, and
+`None` when the request is below the field's range (100 mA for the input
+limit, 3840 mV for the charge voltage, a negative current) or the part did
+not take it; a request above the range sets the top of it.  The package's
+own functions (`charge_current_set`, `charge_voltage_set`,
+`input_current_set`) answer `-1` for a refusal and set the bottom of the
+range for a request below it.
 
 ### The watchdog
 
@@ -295,9 +305,12 @@ tier refuses an `async fn`.
   compensation (REG08), the current pulse control (EN_PUMPX, PUMPX_UP and
   PUMPX_DN) and the MaxCharge adapter's own settings beyond the three
   detection enables; `reg_update` reaches the bits.
-- A charge phase of constant voltage: the part reports fast charging for
-  both the constant-current and the constant-voltage phase, and `charge()`
-  answers `ChargeConstantCurrent` for both.
+- The two fast-charge phases apart: the part reports fast charging for both
+  the constant-current and the constant-voltage phase, and `charge()`
+  answers `ChargeActive` for both.
+- A dead cell in `battery_health()`, and a battery temperature: the part has
+  no flag for the first and reads its thermistor as a percent of REGN, not
+  as a temperature.
 - A discharge current, which the part does not measure.
 - A percent of charge: a charger has no gauge.  `battery().percent` is
   `None`.
@@ -308,8 +321,8 @@ tier refuses an `async fn`.
   this driver implements, the wiring record and the register helpers it
   uses.
 - [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) names
-  the `I2cBus`, `Timer`, `GpioOut` and `AsyncEdge` traits and the board
-  handles.
+  the `I2cBus` (which also waits), `GpioOut` and `AsyncEdge` traits and the
+  board handles.
 - axp2101-nv drives a PMIC with a charger, and bq27441-nv and
   max17048-nv drive fuel gauges, on the same `PowerManager` trait.
 

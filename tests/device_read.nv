@@ -17,9 +17,9 @@
 // Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
 // `novo build --target=nrf54lm20-dk tests/device_read.nv`.
 
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use embedded_hal.{ BoardI2c, BoardGpio }
 use dev_bus
-use dev_power.{ ChargeState }
+use dev_power.{ ChargeState, MilliAmps, MilliVolts, PowerManager }
 use bq25895
 use bq25895.{ Bq25895 }
 
@@ -40,17 +40,18 @@ fn phase_number(s: ChargeState) -> Int
         ChargeState.ChargeConstantVoltage => 3
         ChargeState.ChargeDone            => 4
         ChargeState.ChargeFault           => 5
+        ChargeState.ChargeActive          => 6
 
 @tier(embedded)
 fn main() [hw]
-    let charger = Bq25895.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let charger = Bq25895.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
     hal.timer.delay_ms(50)
     if not charger.begin()
         hal.uart.write("bq25895: no answer\n")
         return
-    let _ = charger.set_input_current(1500)
-    let _ = charger.set_charge_current(1024)
-    let _ = charger.set_charge_voltage(4208)
+    let _ = charger.input_set_current_limit(MilliAmps { ma: 1500 })
+    let _ = charger.charge_set_current(MilliAmps { ma: 1024 })
+    let _ = charger.charge_set_voltage_limit(MilliVolts { mv: 4208 })
     let _ = charger.set_charging(true)
     loop
         match charger.measure()
