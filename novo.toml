@@ -1,6 +1,6 @@
 [package]
 name        = "bq25895-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for TI's BQ25895 single-cell I2C fast charger on an I2C bus: the input current and voltage limits, the fast charge, precharge and termination currents, the charge voltage and recharge threshold, the watchdog and the safety timer, the status and the fault register read twice, the battery monitor's ADC readings, the boost mode as configuration, the ship mode and the device identity, as the charger side of devices-nv's PowerManager and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
