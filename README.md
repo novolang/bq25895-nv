@@ -157,7 +157,7 @@ REG0C.
 
 | Module | What is in it |
 |---|---|
-| `bq25895` | The type `Bq25895`, the trait `Bq25895Port` and the host-scheduler `Bq25895Host`; `Bq25895Adc` and `Bq25895Faults`; the bus framing, the steps of the fields, the input, the charge, the watchdog, the status and the faults, the battery monitor, the boost mode and the rail, the ship mode |
+| `bq25895` | The type `Bq25895`, the trait `Bq25895Port` over devices-nv's `RegPort` and the host-scheduler `Bq25895Host`; `Bq25895Adc` and `Bq25895Faults`; the bus framing, the steps of the fields, the input, the charge, the watchdog, the status and the faults, the battery monitor, the boost mode and the rail, the ship mode |
 
 ## How to choose an entry point
 
@@ -188,7 +188,10 @@ The waits go through the bus (`I2cBus.delay_ms`), so there is no timer slot.  It
 | `int_level()` | the level of the INT line, -1 for a wiring with none |
 
 The module's functions take a `Bq25895Port`, the trait a type that holds a
-bus implements, so a test runs them over a double.  They hold more than the
+bus implements, so a test runs them over a double.  The type implements
+devices-nv's `RegPort` (`read_regs` and `write_reg`) as well, and the
+register reads and writes are its methods: `port.read_reg(reg)`,
+`port.write_reg_verified(reg, v)`.  They hold more than the
 methods: the safety timer, the thresholds, the optimizer, the detections,
 the continuous conversion, the ship mode and the absolute input voltage
 limit.

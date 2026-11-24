@@ -89,7 +89,7 @@
 
 use core.rt
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, BatteryHealth, PowerSource, PowerManager, PowerManagerAsync }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -197,15 +197,13 @@ struct Bq25895Faults
     past: Int
     now: Int
 
-// A bus the part is on.  `setup` makes the bus and the pins ready and
-// answers whether the wiring suits the bus; `read_regs` reads `n`
-// registers from `reg` in one transaction; `write_reg` writes one
-// register; `pause_ms` waits; `irq_level` answers the level of the INT
+// A bus the part is on. `RegPort` is the register access, `read_regs` and
+// `write_reg`, with the register reads and writes built on them; `setup`
+// makes the bus and the pins ready and answers whether the wiring suits
+// the bus; `pause_ms` waits; `irq_level` answers the level of the INT
 // pin.
-pub trait Bq25895Port
+pub trait Bq25895Port: RegPort
     fn setup(self) -> Bool [hw]
-    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
-    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
     fn pause_ms(self, ms: Int) [hw]
     fn irq_level(self) -> Int [hw]
 
@@ -235,49 +233,46 @@ pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Boo
 
 // The level of the INT pin on the board, 1 or 0, or -1 for a wiring with
 // no interrupt pin.
-pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
-    let Some(irq) = w.irq else return -1
-    gpio.get(irq)
+pub @deprecated(since = "0.3.0", replace_with = "dev_bus.wiring_irq_level")
+fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    dev_bus.wiring_irq_level(gpio, w)
 
 // ── Register access ──────────────────────────────────────────────────
 
 // One register, or `None` when the part did not answer.
-pub fn reg_read<P: Bq25895Port>(p: P, reg: Int) -> ?Int [hw]
-    var b: DevBytes = Vec.new()
-    if not p.read_regs(reg, 1, var b)
-        return None
-    Some(b[0] as Int)
+pub @deprecated(since = "0.3.0", replace_with = "RegPort.read_reg")
+fn reg_read<P: Bq25895Port>(p: P, reg: Int) -> ?Int [hw]
+    p.read_reg(reg)
 
 // Writes `v` to the register `reg` and reads it back: whether the part
 // holds the value.  Not for a register with a bit that clears itself
 // (REG02's CONV_START, REG03's WD_RST, REG09's FORCE_ICO, REG14's
 // REG_RST).
-pub fn reg_write<P: Bq25895Port>(p: P, reg: Int, v: Int) -> Bool [hw]
-    if not p.write_reg(reg, v)
-        return false
-    reg_read(p, reg) == Some(v & 0xFF)
+pub @deprecated(since = "0.3.0", replace_with = "RegPort.write_reg_verified")
+fn reg_write<P: Bq25895Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg_verified(reg, v)
 
 // Reads `reg`, clears the bits of `mask`, sets `fl` (a subset of `mask`),
 // writes it back and reads it again: whether the part holds the bits.
 // Fix kept: every setting is a masked update, as the part keeps several
 // settings in one register, and a write of one byte would undo the others.
 pub fn reg_update<P: Bq25895Port>(p: P, reg: Int, mask: Int, fl: Int) -> Bool [hw]
-    let Some(old) = reg_read(p, reg) else return false
+    let Some(old) = p.read_reg(reg) else return false
     let next = (old & (0xFF ^ mask)) | (fl & mask)
     if not p.write_reg(reg, next)
         return false
-    let Some(back) = reg_read(p, reg) else return false
+    let Some(back) = p.read_reg(reg) else return false
     (back & mask) == (fl & mask)
 
 // A masked update of a register that holds a self-clearing bit that the
 // update must not write back as it reads: `keep_clear` bits are written as
 // 0 whatever they read.  The read back compares the bits of `mask` only.
 fn update_clearing<P: Bq25895Port>(p: P, reg: Int, mask: Int, fl: Int, keep_clear: Int) -> Bool [hw]
-    let Some(old) = reg_read(p, reg) else return false
+    let Some(old) = p.read_reg(reg) else return false
     let next = (old & (0xFF ^ keep_clear) & (0xFF ^ mask)) | (fl & mask)
     if not p.write_reg(reg, next)
         return false
-    let Some(back) = reg_read(p, reg) else return false
+    let Some(back) = p.read_reg(reg) else return false
     (back & mask) == (fl & mask)
 
 // ── The steps of the fields ──────────────────────────────────────────
@@ -437,7 +432,7 @@ pub fn ichgr_ma_of(code: Int) -> Int
 // BQ25895, and `rev` the device revision, 1.  `None` when the part does not
 // answer or the part number is another.
 pub fn id_read<P: Bq25895Port>(p: P) -> ?DeviceId [hw]
-    let Some(r) = reg_read(p, REG14) else return None
+    let Some(r) = p.read_reg(REG14) else return None
     let pn = (r >> 3) & 7
     if pn != PN_BQ25895
         return None
@@ -450,7 +445,7 @@ pub fn reset<P: Bq25895Port>(p: P) -> Bool [hw]
     if not p.write_reg(REG14, REG_RST)
         return false
     for _i in 0..RESET_POLLS
-        let Some(r) = reg_read(p, REG14) else return false
+        let Some(r) = p.read_reg(REG14) else return false
         if (r & REG_RST) == 0
             return true
     false
@@ -480,13 +475,13 @@ pub fn input_current_set<P: Bq25895Port>(p: P, ma: Int) -> Int [hw]
 
 // The IINLIM register's limit in milliamps, or -1.
 pub fn input_current_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG00) else return -1
+    let Some(r) = p.read_reg(REG00) else return -1
     ilim_ma(r & IINLIM_MASK)
 
 // The input current limit in effect, REG13's IDPM_LIM, in milliamps, or -1:
 // it follows the input source detection and the input current optimizer.
 pub fn input_current_effective<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG13) else return -1
+    let Some(r) = p.read_reg(REG13) else return -1
     ilim_ma(r & 0x3F)
 
 // Turns the high-impedance mode on or off: the input is disconnected from
@@ -527,7 +522,7 @@ pub fn ico_set<P: Bq25895Port>(p: P, on: Bool) -> Bool [hw]
 // Whether the input current optimizer has found the maximum input current
 // (ICO_OPTIMIZED), or `None`.
 pub fn ico_optimized<P: Bq25895Port>(p: P) -> ?Bool [hw]
-    let Some(r) = reg_read(p, REG14) else return None
+    let Some(r) = p.read_reg(REG14) else return None
     Some((r & 0x40) != 0)
 
 // Sets what the part does when VBUS is plugged in: `auto` the D+/D-
@@ -565,7 +560,7 @@ pub fn charge_current_set<P: Bq25895Port>(p: P, ma: Int) -> Int [hw]
 
 // The fast charge current in milliamps, or -1.
 pub fn charge_current_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG04) else return -1
+    let Some(r) = p.read_reg(REG04) else return -1
     ichg_ma(r & ICHG_MASK)
 
 // Sets the precharge current in milliamps, rounded down to a step of 64 mA
@@ -578,7 +573,7 @@ pub fn precharge_current_set<P: Bq25895Port>(p: P, ma: Int) -> Int [hw]
 
 // The precharge current in milliamps, or -1.
 pub fn precharge_current_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG05) else return -1
+    let Some(r) = p.read_reg(REG05) else return -1
     ipre_ma((r >> 4) & 0x0F)
 
 // Sets the termination current in milliamps, rounded down to a step of 64
@@ -591,7 +586,7 @@ pub fn termination_current_set<P: Bq25895Port>(p: P, ma: Int) -> Int [hw]
 
 // The termination current in milliamps, or -1.
 pub fn termination_current_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG05) else return -1
+    let Some(r) = p.read_reg(REG05) else return -1
     iterm_ma(r & ITERM_MASK)
 
 // Turns the charge termination on or off (EN_TERM, on at reset).  Whether
@@ -614,7 +609,7 @@ pub fn charge_voltage_set<P: Bq25895Port>(p: P, mv: Int) -> Int [hw]
 
 // The charge voltage in millivolts, or -1.
 pub fn charge_voltage_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG06) else return -1
+    let Some(r) = p.read_reg(REG06) else return -1
     vreg_mv((r >> 2) & 0x3F)
 
 // Sets the recharge threshold: the battery voltage below the charge voltage
@@ -686,14 +681,14 @@ pub fn watchdog_set<P: Bq25895Port>(p: P, secs: Int) -> Bool [hw]
 // itself: whether the part acknowledged.  The other bits of REG03 are
 // written as they read, so the charge and the boost mode are not changed.
 pub fn watchdog_feed<P: Bq25895Port>(p: P) -> Bool [hw]
-    let Some(old) = reg_read(p, REG03) else return false
+    let Some(old) = p.read_reg(REG03) else return false
     p.write_reg(REG03, old | WD_RST)
 
 // ── Status and faults ────────────────────────────────────────────────
 
 // REG0B, the status byte, or -1 when the part did not answer.
 pub fn status_read<P: Bq25895Port>(p: P) -> Int [hw]
-    reg_read(p, REG0B) ?? -1
+    p.read_reg(REG0B) ?? -1
 
 // The VBUS status of a REG0B byte: 0 no input, 1 USB host SDP, 2 USB CDP, 3
 // USB DCP, 4 adjustable high voltage DCP (MaxCharge), 5 unknown adapter, 6
@@ -716,8 +711,8 @@ pub fn power_good(status: Int) -> Bool
 // read and the part sends no INT for a new one until then, so a program that
 // reads once sees an old fault, or none that has gone.
 pub fn faults_read<P: Bq25895Port>(p: P) -> ?Bq25895Faults [hw]
-    let Some(past) = reg_read(p, REG0C) else return None
-    let Some(now) = reg_read(p, REG0C) else return None
+    let Some(past) = p.read_reg(REG0C) else return None
+    let Some(now) = p.read_reg(REG0C) else return None
     Some(Bq25895Faults { past: past, now: now })
 
 // Whether a REG0C byte reports a watchdog expiry.
@@ -792,7 +787,7 @@ pub fn source_read<P: Bq25895Port>(p: P) -> PowerSource [hw]
 // Starts a one-shot conversion (CONV_START with CONV_RATE clear): whether
 // the part took it.  The part clears CONV_START when the conversion is done.
 pub fn adc_start<P: Bq25895Port>(p: P) -> Bool [hw]
-    let Some(r) = reg_read(p, REG02) else return false
+    let Some(r) = p.read_reg(REG02) else return false
     if (r & CONV_RATE) != 0
         return false
     p.write_reg(REG02, r | CONV_START)
@@ -800,7 +795,7 @@ pub fn adc_start<P: Bq25895Port>(p: P) -> Bool [hw]
 // Whether a conversion is running: CONV_START is set, which it also is
 // during input source detection.  `None` when the part did not answer.
 pub fn adc_busy<P: Bq25895Port>(p: P) -> ?Bool [hw]
-    let Some(r) = reg_read(p, REG02) else return None
+    let Some(r) = p.read_reg(REG02) else return None
     Some((r & CONV_START) != 0)
 
 // Turns the continuous conversion, once a second, on or off (CONV_RATE).
@@ -832,7 +827,7 @@ pub fn adc_read<P: Bq25895Port>(p: P) -> ?Bq25895Adc [hw]
 // data sheet's maximum conversion time is 1 s, so `polls` of 100 or more
 // waits for it.
 pub fn adc_measure<P: Bq25895Port>(p: P, polls: Int) -> ?Bq25895Adc [hw]
-    let Some(r) = reg_read(p, REG02) else return None
+    let Some(r) = p.read_reg(REG02) else return None
     if (r & CONV_RATE) != 0
         return adc_read(p)
     if not adc_start(p)
@@ -865,7 +860,7 @@ pub fn boost_set<P: Bq25895Port>(p: P, mv: Int, khz: Int) -> Int [hw]
 
 // The boost output voltage in millivolts, or -1.
 pub fn boost_voltage_get<P: Bq25895Port>(p: P) -> Int [hw]
-    let Some(r) = reg_read(p, REG0A) else return -1
+    let Some(r) = p.read_reg(REG0A) else return -1
     boostv_mv((r >> 4) & 0x0F)
 
 // Turns the boost mode on or off (OTG_CONFIG).  The mode starts when the
@@ -912,7 +907,7 @@ pub fn rail_state_of<P: Bq25895Port>(p: P, rail: Int) -> RailState [hw]
     if fault_boost(f.now)
         return RailState.RailFault
     let s = status_read(p)
-    let c = reg_read(p, REG03) ?? 0
+    let c = p.read_reg(REG03) ?? 0
     if s >= 0 and vbus_status(s) == 7 and (c & OTG_CONFIG) != 0
         return RailState.RailOn
     RailState.RailOff
@@ -1054,21 +1049,22 @@ struct Bq25895
     pins: BoardGpio
     w: DeviceWiring
 
-impl Bq25895Port for Bq25895
-    fn setup(self) -> Bool [hw]
-        i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Bq25895
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         i2c_write(self.bus, self.w, reg, v)
 
+impl Bq25895Port for Bq25895
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
     fn pause_ms(self, ms: Int) [hw]
         self.bus.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
-        irq_level_of(self.pins, self.w)
+        dev_bus.wiring_irq_level(self.pins, self.w)
 
 impl Bq25895
     // The part at `w.addr` on the board's bus, as a board's device table
@@ -1214,7 +1210,7 @@ fn host_of<P: Bq25895Port>(dev: P) -> Bq25895Host<P>
 impl PowerManagerAsync[hw, time] for Bq25895Host
     @tier(app)
     async fn battery_measure(self) -> ?BatteryReading [hw, time]
-        let Some(r) = reg_read(self.dev, REG02) else return None
+        let Some(r) = self.dev.read_reg(REG02) else return None
         if (r & CONV_RATE) == 0
             if not adc_start(self.dev)
                 return None

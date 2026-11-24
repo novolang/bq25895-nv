@@ -30,7 +30,7 @@ main    = "src/main.nv"
 
 [dependencies]
 bq25895-nv       = { path = "$PKG" }
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"
 embedded-hal-nv = "^0.4.0"
 EOF
 

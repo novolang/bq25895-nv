@@ -24,7 +24,7 @@
 use std.test
 use core.rt
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, BatteryHealth, PowerSource, PowerManager, PowerManagerAsync }
 use dev_id.{ DeviceId, Identifiable }
 use bq25895
@@ -248,15 +248,16 @@ struct Dut
     pins: FakePins
     w: DeviceWiring
 
-impl Bq25895Port for Dut
-    fn setup(self) -> Bool [hw]
-        bq25895.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         bq25895.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         bq25895.i2c_write(self.bus, self.w, reg, v)
+
+impl Bq25895Port for Dut
+    fn setup(self) -> Bool [hw]
+        bq25895.i2c_setup(self.bus, self.pins, self.w)
 
     fn pause_ms(self, ms: Int) [hw]
         self.bus.delay_ms(ms)
@@ -411,16 +412,16 @@ fn test_setup_makes_the_bus_and_the_int_pin_ready() [io]
 fn test_a_register_is_read_written_and_updated_by_mask() [io]
     let c = chip()
     let d = dut(c)
-    test.assert(bq25895.reg_read(d, 0x14) == Some(0x39))
+    test.assert(d.read_reg(0x14) == Some(0x39))
     test.assert(bq25895.reg_read(dut(absent()), 0x14) == None)
-    test.assert(bq25895.reg_write(d, 0x08, 0x5A))
+    test.assert(d.write_reg_verified(0x08, 0x5A))
     test.assert_eq(reg(d, 0x08), 0x5A)
     c.mute.insert(0x08, 1)
-    test.assert(not bq25895.reg_write(d, 0x08, 0x11))
+    test.assert(not d.write_reg_verified(0x08, 0x11))
     c.mute.insert(0x08, 0)
     // The part ignores a write to a read-only register: the read back
     // differs.
-    test.assert(not bq25895.reg_write(d, 0x0B, 0x11))
+    test.assert(not d.write_reg_verified(0x0B, 0x11))
     // An update changes only the bits of the mask.
     c.regs.insert(0x08, 0xF0)
     test.assert(bq25895.reg_update(d, 0x08, 0x0F, 0x05))
@@ -1128,3 +1129,12 @@ fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
     test.assert(g.power_source() == PowerSource.PowerUnknown)
     test.assert(g.device_id() == None)
     test.assert(not g.device_probe(7))
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(bq25895.reg_read(d, 0x14), d.read_reg(0x14))
+    test.assert_eq(bq25895.reg_write(d, 0x14, 0x01), d.write_reg_verified(0x14, 0x01))
