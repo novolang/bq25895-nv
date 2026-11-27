@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 — 2026-11-27
+
+The README example and `tests/device_read.nv`, the program it shows, call `charger.set_charging` without a binding.  The three limit setters answer `?MilliAmps` and `?MilliVolts`; the example drops those answers with `let _ =` and a comment that says why: a refused write leaves the limit the part powers up with.  No signature of the package changed.
+
 ## 0.3.0 — 2026-11-24
 
 The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Bq25895Port` is smaller by them.  The release depends on devices-nv 0.4.1.

@@ -49,10 +49,11 @@ fn main() [hw]
     if not charger.begin()
         hal.uart.write("bq25895: no answer\n")
         return
+    // A refused write leaves the limit the part powers up with, so the answers are not read.
     let _ = charger.input_set_current_limit(MilliAmps { ma: 1500 })
     let _ = charger.charge_set_current(MilliAmps { ma: 1024 })
     let _ = charger.charge_set_voltage_limit(MilliVolts { mv: 4208 })
-    let _ = charger.set_charging(true)
+    charger.set_charging(true)
     loop
         match charger.measure()
             Some(a) =>
